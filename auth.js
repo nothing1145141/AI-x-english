@@ -38,9 +38,25 @@ function loadUsers() {
 function saveUsers(list) { writeJsonAtomic(USERS_FILE, list); }
 
 /**
- * 免登录模式时代的遗留函数已移除：现在鉴权恒启用，
- * 账号一律通过 register / login 创建与进入。
+ * 免登录模式使用的本机账号：取账号表里的第一个账号，保证沿用已有学习数据；
+ * 一个都没有时创建一个无密码的本地账号（id 固定），让数据有地方落盘。
  */
+function localUser() {
+  const users = loadUsers();
+  if (users.length) return users[0];
+  const user = {
+    id: 'u_local',
+    username: 'local',
+    nickname: '本机用户',
+    salt: '',
+    hash: '',
+    createdAt: new Date().toISOString(),
+    lastLoginAt: null
+  };
+  users.push(user);
+  saveUsers(users);
+  return user;
+}
 
 function hashPassword(password, salt) {
   return crypto.scryptSync(String(password), Buffer.from(salt, 'hex'), 64).toString('hex');
@@ -185,6 +201,7 @@ function storeFile(userId) {
 
 module.exports = {
   COOKIE_NAME,
+  localUser,
   register,
   login,
   publicUser,

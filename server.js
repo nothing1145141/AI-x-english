@@ -439,38 +439,11 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
 
   try {
-    const token = auth.tokenFrom(req);
-    const sessionHit = token ? auth.findSession(token) : null;
-    const currentUser = sessionHit ? auth.publicUser(sessionHit.user) : null;
+    // 免登录模式：恒使用本机账号（账号表第一个；没有则创建），
+    // 学习数据仍按账号独立落盘，但不再向用户暴露登录 / 注册，也不读取旧会话。
+    const currentUser = Object.assign(auth.publicUser(auth.localUser()), { local: true });
 
-    /* ---------- 账号与会话 ---------- */
-    if (req.method === 'POST' && p === '/api/auth/register') {
-      const body = await readJsonBody(req, 64 * 1024);
-      try {
-        const user = auth.register(body);
-        const t = auth.createSession(user.id);
-        send(res, 200, { ok: true, user: auth.publicUser(user) }, { 'Set-Cookie': auth.sessionCookie(t, req) });
-      } catch (e) {
-        send(res, 400, { ok: false, error: e.message });
-      }
-      return;
-    }
-    if (req.method === 'POST' && p === '/api/auth/login') {
-      const body = await readJsonBody(req, 64 * 1024);
-      try {
-        const user = auth.login(body);
-        const t = auth.createSession(user.id);
-        send(res, 200, { ok: true, user: auth.publicUser(user) }, { 'Set-Cookie': auth.sessionCookie(t, req) });
-      } catch (e) {
-        send(res, 401, { ok: false, error: e.message });
-      }
-      return;
-    }
-    if (req.method === 'POST' && p === '/api/auth/logout') {
-      auth.destroySession(token);
-      send(res, 200, { ok: true }, { 'Set-Cookie': auth.clearCookie() });
-      return;
-    }
+    /* ---------- 本机账号 ---------- */
     if (req.method === 'GET' && p === '/api/auth/me') {
       send(res, 200, { ok: true, user: currentUser });
       return;

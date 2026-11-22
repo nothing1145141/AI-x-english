@@ -1,6 +1,5 @@
 import { init, subscribe, onSync, getState, setSettings, getSettings } from './store.js';
 import { fetchMe, getUser } from './auth.js';
-import { showLogin } from './login-screen.js';
 import { speak as speakText, speakSequence, splitForSpeech, stop as stopSpeaking, ttsAvailable } from './tts.js';
 import { isNative } from './bridge.js';
 import { computeStats } from './stats.js';
@@ -164,18 +163,9 @@ async function boot() {
     return;
   }
 
-  // 会话在使用中失效（过期 / 服务端清理）：切回登录屏，登录后重新进入
-  window.addEventListener('ww:unauthorized', () => {
-    stopSpeaking();
-    showLogin((user) => startApp(user));
-  });
-
-  // 未登录 → 登录屏；服务不可达 → 错误提示（与未登录区分开）
+  // 免登录：直接读取服务端固定的本机账号；服务不可达时由外层 catch 显示重试
   const me = await fetchMe();
-  if (!me) {
-    showLogin((user) => startApp(user));
-    return;
-  }
+  if (!me) throw new Error('服务端未返回本机账号');
   await startApp(me);
 }
 

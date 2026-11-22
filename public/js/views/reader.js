@@ -834,8 +834,9 @@ export function mount() {
       collectImport();
       busy = true; refreshMe();
       try {
-        const dataUrl = await pickFile('image/*', true);
-        if (!dataUrl) { busy = false; refreshMe(); return; }
+        const file = await pickFile('image/*', true);
+        if (!file) { busy = false; refreshMe(); return; }
+        const dataUrl = await readAsDataURL(file);
         toast('正在识别照片正文…', 'info');
         const r = await ocrArticle(dataUrl, '');
         if (!r.text) throw new Error('没有识别到正文，请换一张更清晰的照片，或用「导入文章」多拍几张');
@@ -851,11 +852,16 @@ export function mount() {
     if (a === 'pickArticleCamera') {
       // 移动端直达相机的单张入口（capture 属性调起系统相机）
       collectImport();
-      const dataUrl = await pickFile('image/*', true);
-      if (!dataUrl) return;
+      const file = await pickFile('image/*', true);
+      if (!file) return;
       toast('正在压缩图片…', 'info');
-      try { importDraft.photos.push({ dataUrl: await compressImage(dataUrl), name: `camera-${Date.now()}.jpg` }); }
-      catch (_) { importDraft.photos.push({ dataUrl, name: `camera-${Date.now()}.jpg` }); }
+      try {
+        const dataUrl = await readAsDataURL(file);
+        try { importDraft.photos.push({ dataUrl: await compressImage(dataUrl), name: `camera-${Date.now()}.jpg` }); }
+        catch (_) { importDraft.photos.push({ dataUrl, name: `camera-${Date.now()}.jpg` }); }
+      } catch (err) {
+        toast(`读取照片失败：${err.message}`, 'error');
+      }
       refreshMe();
       return;
     }

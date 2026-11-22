@@ -11,6 +11,7 @@ let query = '';
 let result = null;        // { source:'builtin'|'user'|'ai'|'none', data }
 let loading = false;
 let aiLoading = false;
+let pendingAiSerial = 0;  // 已有 AI 请求在跑时，记录期间最新一次查询，结束后补跑
 let suggestions = [];
 let inputFocusPos = null;
 let mdxEntry = null;      // 导入的 MDX 词典命中结果
@@ -142,10 +143,16 @@ async function doSearch(term) {
 }
 
 async function deepAi(serial = searchSerial) {
-  if (!query || aiLoading) return;
+  if (!query) return;
+  if (aiLoading) {
+    // 单飞：不并发烧钱，但记住最新查询，等当前请求结束后补跑
+    if (serial === searchSerial) pendingAiSerial = serial;
+    return;
+  }
   aiLoading = true; refresh();
   try {
-    const r = await explainWord(query);
+    const term = query;
+    const r = await explainWord(term);
     if (serial !== searchSerial) return;   // 过期响应丢弃，不覆盖新查询的结果
     result = { source: 'ai', data: r };
     toast('AI 讲解已生成', 'success');
@@ -153,9 +160,16 @@ async function deepAi(serial = searchSerial) {
     if (serial !== searchSerial) return;
     toast(`AI 讲解失败：${err.message}`, 'error', 5000);
     if (!result) result = { source: 'none', data: { term: query } };
+  } finally {
+    // 无论成功、失败还是过期退出，都必须复位加载态，否则界面会永久停在「AI 正在讲解…」
+    aiLoading = false;
+    refresh();
+    if (pendingAiSerial) {
+      const queued = pendingAiSerial;
+      pendingAiSerial = 0;
+      if (queued === searchSerial) deepAi(searchSerial);
+    }
   }
-  aiLoading = false;
-  refresh();
 }
 
 function addToBook() {
