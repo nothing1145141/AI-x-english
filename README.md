@@ -6,7 +6,11 @@
 
 ## 功能
 
-- **文章精读**：导入英文文章，逐句拆解结构、讲解语法、提取重点词，标注原文位置。
+- **文章精读**：导入英文文章，按「词汇 → 长难句 → 阅读理解」三部分推进，逐句拆解结构、讲解语法、提取重点词，标注原文位置。
+- **词汇标注与背诵**：对照《高中核心词汇1000+高考超纲词》（`高中核心词汇1000+高考超纲词.xlsx`）标出文中的核心词与超纲词，可一键入库；「背诵本文词」在弹窗里直接过卡片，进度与背单词页共用，答错的词进入「阅读错词」。
+- **背单词**：两个范围——「阅读错词」（阅读 / 练习里答错、到期的词）与「词表的词」（核心 1000 + 超纲词）。
+- **阅读理解**：按北京卷 C/D 篇难度生成 4 道单选题（固定 1 道主旨题 + 细节 / 推理 / 态度 / 词义），作答后逐题给解析与原文依据。
+- **首页复习板块**：把到期词、试卷错题、阅读题未过关的文章、精读理解度偏低的句子汇总成可执行清单。
 - **单词速查 / 词库**：词形还原、柯林斯 MDX 词典查询、生词收藏、按 SM-2 思路安排复习。
 - **语法分析**：本地 spaCy 给出确定性句法骨架（分词、词性、依存、从句边界），再交给大模型组织讲解；两者不一致时以句法结果为准。
 - **朗读**：用浏览器自带的 `speechSynthesis` 朗读，单词、句子、整篇文章都能点「听」，零依赖、不下载模型；语音与语速可在设置里换。
@@ -39,7 +43,7 @@
 
 ## 配置 API Key
 
-仓库中**不含任何 API Key**，`config.json` 已被 git 忽略。首次使用先复制一份配置模板：
+本地 Node 版的 `config.json` 已被 git 忽略，首次使用先复制一份配置模板：
 
 ```bash
 cp config.example.json config.json
@@ -62,18 +66,39 @@ Key 的三种提供方式，任选一种，都不会进入版本库：
 
 默认 `config.json` 的 `host` 为 `0.0.0.0`（局域网内设备可访问）。**免登录模式下数据接口没有鉴权**，同一局域网内的任何设备都能读写你的学习数据；传输还是明文 HTTP。只建议在可信内网临时使用，公共 Wi-Fi 下务必关闭；要仅本机访问，把 `host` 改成 `127.0.0.1`。
 
+## 部署到 Cloudflare Workers（测试）
+
+仓库内提供 Worker 版本，静态资源由 Workers Assets 提供，`/api/*` 进入 [worker.js](worker.js)，学习数据存 KV。
+
+- **测试 Key 已直接写进 `worker.js` 的 `DEFAULTS`**（免费额度，仅用于测试），也可用 `AI_API_KEY` / `AI_API_BASE` 环境变量覆盖。
+- Worker 版能力边界（前端会自动降级，不会报错打断使用）：
+  - 可用：文章阅读、词汇/长难句/阅读理解、背单词、复习、AI 讲解与出题、图片上传。
+  - 不可用：内置 ECDICT 词典与 MDX 导入、本地 NLP 句法、语音评测、定时提醒。
+  - 学习数据存在 KV（单用户单键），清空浏览器不会丢，但 KV 免费额度每天写入次数有限。
+- 部署命令：
+
+```bash
+npx wrangler login
+npx wrangler kv namespace create WORDWISE_KV   # 把返回的 id 填进 wrangler.jsonc
+npx wrangler deploy
+```
+
+本地预览 Worker 运行时：`npx wrangler dev`（无需登录）。
+
 ## 目录结构
 
 ```text
 wordwise/
-├─ server.js          # 服务端：静态资源、API、AI 代理、配置读写
+├─ server.js          # 本地 Node 服务端：静态资源、API、AI 代理、配置读写
+├─ worker.js          # Cloudflare Workers 版本（同一套前端协议，数据存 KV）
+├─ wrangler.jsonc     # Workers 部署配置（Assets + KV）
 ├─ nlp-client.js      # 拉起/健康检查 Python 句法服务，失败降级
 ├─ nlp/
 │  ├─ server.py       # spaCy 句法分析服务（127.0.0.1:8791）
 │  ├─ requirements.txt
 │  └─ setup-venv.bat  # 一键创建 .venv 并自检
 ├─ config.example.json # 配置模板（复制成 config.json 后填写自己的 Key）
-├─ public/            # 前端页面与 JS 模块（js/tts.js 为朗读封装）
+├─ public/            # 前端页面与 JS 模块（js/tts.js 朗读、js/vocab1000.js 词表数据、js/article-vocab.js 词表匹配）
 ├─ data/              # 本地数据（已忽略，不入库）
 ├─ tools/             # 词典构建、局域网地址、电子书测试脚本
 └─ 环境说明.md         # 环境搭建与排错记录
@@ -92,5 +117,7 @@ wordwise/
 
 ## 说明
 
-- 朗读用浏览器自带的 `speechSynthesis`，不依赖任何语音服务；发音评分、口语对话等语音能力尚未实现，设计时再补充文档。
+- 朗读用浏览器自带的 `speechSynthesis`，不依赖任何语音服务。
+- 口语评测的**前端入口已移除**，后端（`speech/server.py`、`/api/speech/*`）与相关数据字段保留，接入方式与接口说明见 [口语评测说明.md](./口语评测说明.md)。
+- 词表文件由 `tools/build_vocab_xlsx.py` 从 xlsx 生成到 `public/js/vocab1000.js`，更新词表后重跑脚本即可。
 - 词典文件（MDX/MDD）体积较大且涉及版权，不随仓库分发；把词典放进 `data/mdx/` 后在应用内导入即可。

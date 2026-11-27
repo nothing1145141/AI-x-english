@@ -33,6 +33,8 @@ const PATHS = {
   eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>',
   play: '<path d="m6 4 14 8-14 8z"/>',
   volume: '<path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/>',
+  mic: '<rect x="9" y="2" width="6" height="11" rx="3"/><path d="M19 11a7 7 0 0 1-14 0M12 18v3M8 21h8"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
   reader: '<path d="M2 4h7a3 3 0 0 1 3 3v13a3 3 0 0 0-3-3H2z"/><path d="M22 4h-7a3 3 0 0 0-3 3v13a3 3 0 0 1 3-3h7z"/>',
   searchWord: '<circle cx="10.5" cy="10.5" r="7"/><path d="m21 21-4.5-4.5M10.5 7.5v6M7.5 10.5h6"/>',

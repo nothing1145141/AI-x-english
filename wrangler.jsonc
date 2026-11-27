@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "wordwise",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "kv_namespaces": [
+    {
+      "binding": "WORDWISE_KV",
+      "id": "REPLACE_WITH_KV_NAMESPACE_ID"
+    }
+  ],
+  "vars": {
+    "AI_API_BASE": "https://developer.amd.com.cn/radeon/api/v1",
+    "WORDWISE_TEXT_MODEL": "Hy4-flash",
+    "WORDWISE_VISION_MODEL": "MiniCPM-V-4.7-35B-A3B",
+    "WORDWISE_GRADING_MODEL": "Hy4-flash",
+    "WORDWISE_DAILY_QUESTIONS": "10"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

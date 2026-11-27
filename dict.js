@@ -81,6 +81,66 @@ function lookup(raw) {
   return hit ? format(hit) : null;
 }
 
+/**
+ * 批量查询：一次查一篇文章的去重词表。
+ * 按首字母分组，每个分片只扫描一次，避免逐词反复遍历大数组。
+ * 返回 { [查询词]: { term, phonetic, meaning, pos, tags, frequency, exchange } }
+ */
+function lookupMany(rawTerms, limit = 3000) {
+  const words = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(rawTerms) ? rawTerms : []) {
+    const w = String(raw || '').trim().toLowerCase();
+    if (!w || w.length > 64 || seen.has(w)) continue;
+    seen.add(w);
+    words.push(w);
+    if (words.length >= limit) break;
+  }
+  const out = {};
+  if (!words.length || !available()) return out;
+
+  const groups = new Map();
+  for (const w of words) {
+    const file = shardPath(w);
+    if (!groups.has(file)) groups.set(file, []);
+    groups.get(file).push(w);
+  }
+
+  for (const [file, list] of groups) {
+    const shard = loadShard(list[0]);
+    if (!Array.isArray(shard)) continue;
+    const exact = new Map();
+    const derived = new Map();
+    for (const e of shard) {
+      const key = String(e.w || '').toLowerCase();
+      if (!key) continue;
+      if (!exact.has(key)) exact.set(key, e);
+      if (!e.x) continue;
+      for (const seg of String(e.x).split('|')) {
+        const v = seg.split(':')[1];
+        if (!v) continue;
+        const k = v.toLowerCase();
+        if (!derived.has(k)) derived.set(k, e);
+      }
+    }
+    for (const w of list) {
+      const hit = exact.get(w) || derived.get(w);
+      if (!hit) continue;
+      const f = format(hit);
+      out[w] = {
+        term: f.term,
+        phonetic: f.phonetic,
+        meaning: f.meanings[0] || '',
+        pos: f.pos,
+        tags: f.tags,
+        frequency: f.frequency,
+        exchange: f.exchange
+      };
+    }
+  }
+  return out;
+}
+
 /** 前缀联想，最多 limit 条 */
 function suggest(raw, limit = 8) {
   const word = String(raw || '').trim().toLowerCase();
@@ -98,4 +158,4 @@ function suggest(raw, limit = 8) {
   return out;
 }
 
-module.exports = { available, meta, lookup, suggest };
+module.exports = { available, meta, lookup, lookupMany, suggest };

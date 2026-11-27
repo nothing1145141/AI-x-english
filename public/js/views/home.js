@@ -2,6 +2,7 @@ import { getState } from '../store.js';
 import { computeStats } from '../stats.js';
 import { icon, esc, fmtDate } from '../ui.js';
 import { go } from '../router.js';
+import { collectReview } from '../review.js';
 
 export const title = '今天';
 export const subtitle = '学习记录与接下来要做的事';
@@ -32,6 +33,8 @@ export function render() {
     .sort((a, b) => String(b.finishedAt || '').localeCompare(String(a.finishedAt || '')))
     .slice(0, 5);
 
+  const review = collectReview(state);
+
   return `
     <div class="page-lead">
       <div>
@@ -50,6 +53,8 @@ export function render() {
       <div><span>今日正确率</span><b>${st.today.accuracy === null ? '—' : st.today.accuracy + '%'}<em>${st.today.questions} 题</em></b></div>
       <div><span>连续</span><b>${st.streak}<em>天</em></b></div>
     </div>
+
+    ${renderReview(review)}
 
     <div class="grid home-main">
       <div class="home-col">
@@ -123,6 +128,88 @@ function wordCount(text) {
   return String(text || '').split(/\s+/).filter(Boolean).length;
 }
 
+/* ---------- 复习：以前不牢固的内容 ---------- */
+
+function renderReview(r) {
+  if (!r.total) {
+    return `<section class="card review-board">
+      <div class="card-head"><div><h2>复习</h2><div class="sub">到期词 / 做错的题 / 没读透的句子</div></div><span class="pill success">暂无欠账</span></div>
+      <div class="feedback">${icon('check', 13)} 目前没有需要回炉的内容。继续读一篇新文章，或做一份试卷。</div>
+    </section>`;
+  }
+
+  const blocks = [];
+
+  if (r.words.items.length) {
+    blocks.push(`<div class="review-block">
+      <div class="review-head">
+        <span class="review-title">${icon('book', 14)} 待复习词 <em>${r.words.count}</em></span>
+        <button class="btn btn-sm" data-action="reviewLearn" type="button">去背单词</button>
+      </div>
+      ${r.words.items.slice(0, 3).map((w) => `
+        <div class="review-row">
+          <div class="review-row-main"><b>${esc(w.term)}</b><span>${esc(w.meaning)}</span></div>
+          <span class="review-tag">${w.mastery}%</span>
+        </div>`).join('')}
+    </div>`);
+  }
+
+  if (r.mistakes.items.length) {
+    blocks.push(`<div class="review-block">
+      <div class="review-head">
+        <span class="review-title">${icon('clipboard', 14)} 做错的题 <em>${r.mistakes.count}</em></span>
+        <span class="tiny muted">点一行看批改</span>
+      </div>
+      ${r.mistakes.items.slice(0, 3).map((m) => `
+        <button class="review-row as-btn" data-action="reviewMistake" data-id="${esc(m.attemptId)}" type="button">
+          <span class="review-row-main"><b>${esc(cut(m.prompt, 52))}</b><span>答案：${esc(cut(m.answer, 30))}</span></span>
+          ${icon('arrowRight', 13)}
+        </button>`).join('')}
+    </div>`);
+  }
+
+  if (r.reading.items.length) {
+    blocks.push(`<div class="review-block">
+      <div class="review-head">
+        <span class="review-title">${icon('reader', 14)} 阅读题没过关 <em>${r.reading.count}</em></span>
+        <span class="tiny muted">正确率未满</span>
+      </div>
+      ${r.reading.items.slice(0, 3).map((x) => `
+        <button class="review-row as-btn" data-action="reviewReading" data-id="${esc(x.articleId)}" type="button">
+          <span class="review-row-main"><b>${esc(cut(x.title, 28))}</b><span>${fmtDate(x.at)} · 阅读理解</span></span>
+          <span class="review-tag ${x.correct === x.total ? 'ok' : ''}">${x.correct}/${x.total}</span>
+        </button>`).join('')}
+    </div>`);
+  }
+
+  if (r.sentences.items.length) {
+    blocks.push(`<div class="review-block">
+      <div class="review-head">
+        <span class="review-title">${icon('highlighter', 14)} 没读透的句子 <em>${r.sentences.count}</em></span>
+        <span class="tiny muted">理解度偏低</span>
+      </div>
+      ${r.sentences.items.slice(0, 3).map((s) => `
+        <button class="review-row as-btn" data-action="reviewSentence" data-id="${esc(s.articleId)}" data-si="${s.index}" type="button">
+          <span class="review-row-main"><b>${esc(cut(s.sentence, 46))}</b><span>${esc(cut(s.title, 18))} · 理解度 ${s.score}</span></span>
+          ${icon('arrowRight', 13)}
+        </button>`).join('')}
+    </div>`);
+  }
+
+  return `<section class="card review-board">
+    <div class="card-head">
+      <div><h2>复习</h2><div class="sub">以前不牢固的内容：到期词、做错的题、没读透的句子</div></div>
+      <span class="pill warn">${r.total} 项待巩固</span>
+    </div>
+    <div class="review-grid">${blocks.join('')}</div>
+  </section>`;
+}
+
+function cut(text, n) {
+  const s = String(text || '').replace(/\s+/g, ' ');
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
 export function mount() {
   document.getElementById('view').addEventListener('click', (e) => {
     const target = e.target.closest('[data-action]');
@@ -137,5 +224,9 @@ export function mount() {
     else if (a === 'learn') go('learn');
     else if (a === 'take') go('quiz', { mode: 'take' });
     else if (a === 'result') go('quiz', { mode: 'result', id: target.dataset.id });
+    else if (a === 'reviewLearn') go('learn', { scope: 'wrong', t: String(Date.now()) });
+    else if (a === 'reviewMistake') go('quiz', { mode: 'result', id: target.dataset.id });
+    else if (a === 'reviewReading') go('reader', { id: target.dataset.id, tab: 'reading' });
+    else if (a === 'reviewSentence') go('reader', { id: target.dataset.id, tab: 'deep', si: target.dataset.si });
   });
 }

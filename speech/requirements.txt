@@ -1,0 +1,13 @@
+# WordWise 本地语音服务依赖（位置：wordwise/.venv，与 NLP 共用虚拟环境）
+#
+# 基础能力（韵律分析 / 词级比对 / 代理）只用 Python 标准库，无需安装任何包。
+# 以下为可选增强，按需取消注释后安装：
+#
+# faster-whisper==1.1.1        # 本地 ASR，提供转写 + 词级置信度（首次使用会下载模型）
+# piper-tts==1.2.0             # 本地 TTS（另需下载 .onnx 模型，设置 PIPER_BIN / PIPER_MODEL）
+#
+# 安装：
+#   .venv\Scripts\python.exe -m pip install faster-whisper -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# OpenPronounce 通常以独立仓库/命令形式提供，接入方式见 README「口语评测」：
+#   set OPENPRONOUNCE_CMD=python path\to\openpronounce_cli.py

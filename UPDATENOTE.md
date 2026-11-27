@@ -5,6 +5,50 @@
 
 ---
 
+## 2026-11-27 · 背诵入口收口 / Drill Entry Refocus
+
+### 中文
+
+1. **「背诵本文词」改为弹窗**：不再跳转到背单词页，直接在阅读器内用同一套卡片（看词选义 / 看义选词）过一遍本文命中的词；关掉弹窗即回到原文，不打断阅读。
+2. **进度真正共用**：抽出 `public/js/drill.js`，背单词页与弹窗都走同一份 `state.meta.learn` 记录、同一套 SRS 更新与今日统计，答错的词两边都能看到。
+3. **背单词页只留两个范围**：`阅读错词`（阅读 / 练习里答错、到期的词，含弹窗中答错的词）与 `词表的词`（《高中核心词汇1000+高考超纲词》，1120 条），取代原先的高考核心词 / 我的词库 / 混合三档。
+4. **词表范围替换**：词表出词改为 xlsx 生成的 `vocab1000.js`，`article-vocab.js` 新增 `vocabList()` 做清洗与去重；首页「待复习词」的入口直接落到「阅读错词」。
+
+### English
+
+1. **In-page drill modal**: "背诵本文词" now opens a modal in the reader and runs the same word↔meaning cards, so the article stays in context.
+2. **Shared progress**: `drill.js` is the single source for drill queueing, `state.meta.learn` records, SRS updates and daily stats; both entries read and write the same data.
+3. **Two scopes only**: `阅读错词` (words missed or due from reading/practice, including modal answers) and `词表的词` (the 1120-entry xlsx list), replacing the previous three scopes.
+4. **Word-list range**: list drilling now uses `vocab1000.js` via `vocabList()`; the home review board's word entry lands on 阅读错词.
+
+---
+
+## 2026-11-27 · 阅读工作流重构 / Reading Workflow Rebuild
+
+### 中文
+
+本轮把「阅读」设为核心，文章页从一列卡片改为四个分区，并把词表、阅读命题接入同一套学习记录：
+
+1. **文章三部分 + 精讲**：阅读页右侧新增页签「词汇 / 长难句 / 阅读理解 / 精讲」。词汇区对照《高中核心词汇1000+高考超纲词》标出命中词，可单条或整批入库，并用与词库相同的卡片（看词选义 / 看义选词）背诵本文词；长难句沿用本地 NLP 识别与清单；精讲保留回译、对话式讲解与全文分析（结构树卡片已移除，点句子后先由学生自己翻译，再按需点「给点提示」）。
+2. **词表数据化**：新增 `tools/build_vocab_xlsx.py`，从 xlsx 生成 `public/js/vocab1000.js`（核心 1000 + 超纲 120）；`public/js/article-vocab.js` 负责词形还原（含不规则形式、短语）与正文一次性多类高亮，纯本地、带缓存。
+3. **阅读理解**：`ai.js` 新增 `generateReadingQuestions()`，固定 4 题（1 道主旨 + 3 道细节 / 推理 / 态度 / 词义），难度对标北京卷 C/D 篇；每题附中文解析与原文依据，依据句会做定位匹配，可跳回原文。题目与作答结果按正文指纹缓存在文章对象上，正文不变不重复出题。
+4. **首页复习板块**：新增 `review.js`，把「到期 / 答错过的词、试卷错题、阅读题未过关的文章、精读理解度偏低的句子」汇总成清单，可直接跳到对应页面重练。
+5. **口语评测收口**：移除前端入口与录音调用（此前视图文件缺失会导致启动报错），后端 `/api/speech/*`、`speech/server.py`、`speakings` 数据字段全部保留；新增《口语评测说明.md》记录接口、降级行为与接回步骤。
+6. **移动端与修复**：分区页签可横向滚动，词表行、阅读选项、复习清单改为单列与合适触摸目标；修复阅读器路由 `id` 未消费导致换文章后刷新回弹的问题；Service Worker 预缓存补齐新模块并升级缓存版本。
+
+### English
+
+This round makes reading the core workflow: the article page is reorganized into four panels, with the word list and reading questions wired into the same learning records.
+
+1. **Three parts + deep reading**: the reader's side column now has "Vocabulary / Hard sentences / Reading comprehension / Deep reading" tabs. Vocabulary marks hits from the 1000-word list plus the out-of-syllabus list, supports one-click import to the wordbook, and reuses the existing card drill (word→meaning / meaning→word) for the article's words. Hard-sentence detection stays unchanged; the deep-reading panel keeps back-translation, coached sentence reading and full-article analysis (the syntax-tree card is gone, and clicking a sentence now waits for the student's own translation before any hint).
+2. **Word list as data**: `tools/build_vocab_xlsx.py` generates `public/js/vocab1000.js` (1000 core + 120 extra); `article-vocab.js` handles lemmatization (including irregular forms and phrases) and single-pass multi-layer highlighting, fully local and cached.
+3. **Reading comprehension**: `generateReadingQuestions()` produces exactly 4 items (1 main-idea + detail / inference / attitude / vocabulary), calibrated to Beijing Gaokao C/D difficulty, each with a Chinese explanation and an evidence sentence anchored back to the article. Questions and results are cached against the article's text fingerprint.
+4. **Home review board**: `review.js` collects due/missed words, wrong quiz items, articles whose reading score is below full marks, and sentences with low comprehension scores, each linking straight back to the relevant practice.
+5. **Speaking assessment pulled back**: the frontend entry and recording hook are removed (the missing view previously broke app start-up); the backend `/api/speech/*`, `speech/server.py` and `speakings` data field are all kept, documented in `口语评测说明.md`.
+6. **Mobile & fixes**: scrollable panel tabs, single-column vocabulary/option/review rows with proper touch targets; fixed the reader route `id` being re-applied after switching articles; Service Worker precache list updated and cache version bumped.
+
+---
+
 ## 2026-11-22 · AI 可靠性闭环 / AI Reliability Loop
 
 ### 中文

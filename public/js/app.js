@@ -20,6 +20,7 @@ import * as settings from './views/settings.js';
 
 const VIEWS = { home, reader, history, lookup, import: importView, words, learn, quiz, dashboard, settings };
 // tab: true 的项出现在移动端底栏（其余仍需在侧栏抽屉中访问）
+// 口语评测暂不开放入口：后端（speech/ 与 /api/speech/*）保留，说明见「口语评测说明.md」
 const NAV = [
   { name: 'home', label: '今天', icon: 'home', tab: true, group: '学习' },
   { name: 'reader', label: '阅读', icon: 'reader', tab: true, group: '学习' },

@@ -42,9 +42,9 @@ export const DEFAULT_SETTINGS = {
   apiMode: 'server',          // server | custom
   customApiBase: '',
   customApiKey: '',
-  textModel: 'DeepSeek-V4.1-Flash',
-  visionModel: 'MiniCPM-V-4.7-1B',
-  gradingModel: 'DeepSeek-V4.1-Flash',
+  textModel: 'Hy4-flash',
+  visionModel: 'MiniCPM-V-4.7-35B-A3B',
+  gradingModel: 'Hy4-flash',
   dailyCount: 10,
   reminderEnabled: false,
   reminderTime: '20:00',
@@ -60,6 +60,7 @@ function normalize(input = {}) {
     sentenceHistory: Array.isArray(input.sentenceHistory) ? input.sentenceHistory : [],
     quizzes: Array.isArray(input.quizzes) ? input.quizzes : [],
     attempts: Array.isArray(input.attempts) ? input.attempts : [],
+    speakings: Array.isArray(input.speakings) ? input.speakings : [],
     activity: Array.isArray(input.activity) ? input.activity : [],
     settings: Object.assign({}, DEFAULT_SETTINGS, input.settings || {}),
     meta: Object.assign({}, input.meta || {}),
@@ -76,7 +77,7 @@ let syncStatus = { level: 'ok', text: '本地就绪' };
 
 /* ---------- 本地 / 远端合并（按 id 取并集，绝不整份覆盖） ---------- */
 function mergeTombstones(x, y) {
-  const out = { words: {}, articles: {}, sentenceHistory: {}, quizzes: {}, attempts: {} };
+  const out = { words: {}, articles: {}, sentenceHistory: {}, quizzes: {}, attempts: {}, speakings: {} };
   for (const src of [x, y]) {
     if (!src) continue;
     for (const type of Object.keys(out)) Object.assign(out[type], src[type] || {});
@@ -144,6 +145,7 @@ function mergeState(a, b) {
     sentenceHistory: union('sentenceHistory'),
     quizzes: union('quizzes'),
     attempts: union('attempts'),
+    speakings: union('speakings').sort((x, y) => String(y.createdAt || '').localeCompare(String(x.createdAt || ''))),
     activity: [...activityMap.values()].sort((x, y) => x.date.localeCompare(y.date)),
     settings: Object.assign({}, older.settings, newer.settings),
     meta: Object.assign({}, older.meta, newer.meta, {
@@ -369,6 +371,35 @@ export function clearSentenceHistory() {
   state.sentenceHistory.forEach((h) => addTombstone('sentenceHistory', h.id));
   state.sentenceHistory = [];
   emit(); save();
+}
+
+/* ---------- 口语评测记录 ---------- */
+export function getSpeakings() { return state.speakings; }
+
+export function saveSpeaking(entry) {
+  if (!entry || !entry.id) return null;
+  const now = new Date().toISOString();
+  const idx = state.speakings.findIndex((s) => s.id === entry.id);
+  const record = Object.assign({}, entry, {
+    createdAt: idx >= 0 ? state.speakings[idx].createdAt : (entry.createdAt || now),
+    updatedAt: now
+  });
+  if (idx >= 0) state.speakings[idx] = record;
+  else state.speakings.unshift(record);
+  state.speakings.sort((x, y) => String(y.createdAt || '').localeCompare(String(x.createdAt || '')));
+  emit(); save();
+  return record;
+}
+
+export function deleteSpeaking(id) {
+  const before = state.speakings.length;
+  state.speakings = state.speakings.filter((s) => s.id !== id);
+  if (state.speakings.length !== before) {
+    addTombstone('speakings', id);
+    emit(); save();
+    return true;
+  }
+  return false;
 }
 
 /* ---------- 试卷 / 作答 ---------- */

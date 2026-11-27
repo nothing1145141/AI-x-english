@@ -1,16 +1,18 @@
 // 文章阅读器：导入文章 → 分句精读 → 选中句子 AI 讲解 → 重点词加入词库
 
 import { getState, getArticle, saveArticle, patchArticle, deleteArticle, cacheSentence, patchSentence, addWords, logActivity, recordSentence } from '../store.js';
-import { ocrArticle, ocrArticleMulti, analyzeArticle, coachSentence, translateSelection, explainWord, compressImage } from '../ai.js';
+import { ocrArticle, ocrArticleMulti, analyzeArticle, coachSentence, translateSelection, explainWord, compressImage, generateReadingQuestions } from '../ai.js';
 import { builtinLookup } from '../gaokao.js';
 import { icon, esc, toast, modal, confirmDialog, pickFile, pickFiles, readAsDataURL, dateKey } from '../ui.js';
 import { vizModalBody, mountVizToggles } from '../viz.js';
 import { nlpSentence } from '../nlp.js';
 import { detectHardSentences, articleHash } from '../hardsent.js';
-import { structPanelHTML, mountStructPanel } from '../structtree.js';
 import { openBacktrans } from '../backtrans.js';
 import { parseEbookFile, renderPdfToImages, EBOOK_ACCEPT, FORMAT_LABELS, countWords as countEbookWords } from '../ebook.js';
-import { go, refresh } from '../router.js';
+import { scanWords, buildKnownSet, computeCoverage, coverageSummary, fetchDictBatch, unknownSurfaceSet, normalizeTerm } from '../coverage.js';
+import { matchArticleVocab, articleVocabEntries, highlightSentence } from '../article-vocab.js';
+import { buildQueue, applyAnswer } from '../drill.js';
+import { go, refresh, getRoute } from '../router.js';
 
 let mode = 'list';            // list | read
 let currentId = null;
@@ -24,6 +26,21 @@ let ebookBusy = false;
 let ebookProgress = '';
 let hardBusy = false;
 let activeNlp = null;        // 当前选中句子的本地句法结构
+
+/** 文章学习三部分（+ 精讲）：词汇 / 长难句 / 阅读理解 / 精讲 */
+let studyTab = 'vocab';
+let tabFromRoute = '';       // 记住从路由带入的 tab，避免每次重渲染把用户切回的页签重置
+let siConsumed = false;      // 深链「打开第 N 句」只消费一次，防止刷新时递归
+let routeIdConsumed = '';    // 路由里的文章 id 只应用一次
+let showCore = true;         // 正文标注词表命中词（核心 1000 / 超纲）
+let vocabShowAll = false;    // 词汇列表默认只展示前若干条
+
+/** 阅读理解作答状态（只存内存，结果落盘到文章对象的 readingResult） */
+let reading = { articleId: null, answers: {}, submitted: false, busy: false, error: '', score: null };
+
+/** 当前文章的生词覆盖率（内存缓存，摘要另存文章对象供列表展示） */
+let coverage = { articleId: null, hash: '', data: null, loading: false, error: '' };
+let showUnknown = false;     // 生词高亮开关
 
 /**
  * 当前的精读对话会话
@@ -81,7 +98,12 @@ async function ensureHardSentences(articleId, { force = false } = {}) {
       hardAt: r.at,
       hardEngine: r.engine
     });
-    if (mode === 'read' && currentId === articleId) refreshKeep();
+    if (mode === 'read' && currentId === articleId) {
+      const art = getArticle(articleId);
+      // 长难句数量参与难度评分，识别完成后重算一次覆盖率
+      if (art && coverage.articleId === articleId) ensureCoverage(art, { force: true });
+      else refreshKeep();
+    }
   } catch (err) {
     console.warn('[hard sentences]', err);
   } finally {
@@ -138,10 +160,14 @@ function articleCard(a) {
   const hasAnalysis = !!a.analysis;
   const explained = a.sentences ? Object.keys(a.sentences).length : 0;
   const words = countWordsEn(a.text);
+  const cov = a.coverage && a.coverage.hash === articleHash(a.text) ? a.coverage : null;
   return `<div class="word-item" data-article="${a.id}" style="cursor:pointer">
     <div class="spread">
       <strong class="art-title">${esc(a.title || '未命名文章')}</strong>
-      ${hasAnalysis ? '<span class="pill success">已分析</span>' : ''}
+      <span class="row" style="gap:6px">
+        ${cov ? `<span class="pill ${cov.level >= 4 ? 'danger' : cov.level >= 3 ? 'warn' : 'success'}">${esc(cov.label)} · 读懂 ${Math.round(cov.knownRatio * 100)}%</span>` : `<span class="pill hide" data-cov-badge="${a.id}"></span>`}
+        ${hasAnalysis ? '<span class="pill success">已分析</span>' : ''}
+      </span>
     </div>
     <div class="tiny muted mt8" style="line-height:1.6;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc((a.text || '').slice(0, 120))}</div>
     <div class="row mt12 tiny muted" style="gap:10px">
@@ -151,6 +177,150 @@ function articleCard(a) {
       <button class="btn btn-sm btn-ghost" data-speak-article="${a.id}" title="从头朗读全文" style="margin-left:auto">${icon('volume', 13)} 听全文</button>
     </div>
   </div>`;
+}
+
+/* ---------- 生词覆盖率 ---------- */
+
+function currentCoverage(a) {
+  if (!a) return null;
+  const hash = articleHash(a.text);
+  if (coverage.articleId === a.id && coverage.hash === hash && coverage.data) return coverage.data;
+  return null;
+}
+
+async function ensureCoverage(a, { force = false } = {}) {
+  if (!a) return;
+  const hash = articleHash(a.text);
+  if (!force && coverage.articleId === a.id && coverage.hash === hash) return;
+  coverage = { articleId: a.id, hash, data: null, loading: true, error: '' };
+  refreshKeep();
+  try {
+    const tokens = scanWords(a.text).map((t) => t.key);
+    const dictInfo = await fetchDictBatch(tokens).catch(() => ({}));
+    if (coverage.articleId !== a.id || coverage.hash !== hash) return;
+    const data = computeCoverage(a.text, buildKnownSet(getState().words), dictInfo, a.hardSentences || []);
+    coverage = { articleId: a.id, hash, data, loading: false, error: '' };
+    patchArticle(a.id, { coverage: coverageSummary(data) });
+  } catch (err) {
+    coverage = { articleId: a.id, hash, data: null, loading: false, error: err.message };
+  }
+  refreshKeep();
+}
+
+function renderCoverageCard(a, cov) {
+  const stored = a.coverage && a.coverage.hash === articleHash(a.text) ? a.coverage : null;
+  const data = cov || stored;
+  const head = `<div class="card-head"><div><h2>生词覆盖</h2><div class="sub">本地词库掌握度 + ECDICT 词频，按词种统计</div></div>${icon('highlighter', 18)}</div>`;
+
+  if (!data && coverage.loading) {
+    return `<section class="card mb16">${head}
+      <div class="empty" style="padding:22px 0"><span class="loading"></span><p>正在统计生词…</p></div>
+    </section>`;
+  }
+  if (!data) {
+    return `<section class="card mb16">${head}
+      <div class="empty" style="padding:22px 0">
+        <p>还没有覆盖率数据${coverage.error ? `（${esc(coverage.error)}）` : ''}</p>
+        <button class="btn btn-sm btn-primary" data-action="calcCoverage">${icon('refresh', 13)} 计算覆盖率</button>
+      </div>
+    </section>`;
+  }
+
+  const pct = Math.round((data.knownRatio || 0) * 100);
+  const total = Math.max(1, data.totalTypes || 0);
+  const bars = [
+    ['已掌握', data.mastered, '#2f6b4f'],
+    ['基础词', data.basic, '#5b5bd6'],
+    ['在学', data.learning, '#c98a4b'],
+    ['生词', data.unknown, '#b0463b']
+  ];
+  const list = (cov && cov.unknownWords ? cov.unknownWords : []).slice(0, 12);
+  return `<section class="card mb16">
+    ${head}
+    <div class="spread" style="align-items:flex-end">
+      <div><div class="stat-label">预计可读懂</div><div class="stat-value" style="font-size:30px">${pct}%</div></div>
+      <div class="row" style="gap:6px">
+        <span class="pill ${data.level >= 4 ? 'danger' : data.level >= 3 ? 'warn' : 'success'}">${esc(data.label || '')}</span>
+        <span class="tiny muted">${'★'.repeat(data.level || 1)}${'☆'.repeat(5 - (data.level || 1))}</span>
+      </div>
+    </div>
+    <div class="mastery-bar mt12" style="width:100%;height:10px;display:flex;overflow:hidden">
+      ${bars.map(([label, n, color]) => `<i style="width:${Math.round((n / total) * 100)}%;background:${color}" title="${label} ${n}"></i>`).join('')}
+    </div>
+    <div class="row mt8" style="gap:12px;flex-wrap:wrap">
+      ${bars.map(([label, n, color]) => `<span class="tiny muted"><b style="color:${color}">●</b> ${label} ${n}</span>`).join('')}
+      <span class="tiny muted">平均 ${data.avgSentenceWords || 0} 词/句 · 长难句 ${data.hardCount || 0}</span>
+    </div>
+
+    ${!cov ? `<div class="tiny muted mt12">完整生词表正在重新统计…</div>`
+      : list.length ? `<div class="mt16">${list.map((w, i) => `
+        <div class="list-row" style="padding:8px 0">
+          <div style="flex:1;min-width:0">
+            <strong class="small">${esc(w.term)}</strong> <span class="tiny muted">${esc(w.phonetic || '')}</span>
+            <div class="tiny muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(w.meaning || '暂无释义')}</div>
+          </div>
+          <span class="tiny muted">×${w.count}</span>
+          <button class="btn btn-sm btn-ghost" data-action="addUnknown" data-i="${i}" title="加入词库">${icon('plus', 13)}</button>
+        </div>`).join('')}</div>`
+      : `<div class="feedback mt12">${icon('check', 13)} 没有发现明显生词，这篇可以放心读。</div>`}
+
+    <div class="row mt12" style="flex-wrap:wrap">
+      ${list.length ? `<button class="btn btn-sm btn-primary" data-action="addAllUnknown">${icon('plus', 13)} 生词入库 (${list.length})</button>` : ''}
+      <button class="btn btn-sm" data-action="quizUnknown">${icon('sparkles', 13)} 用生词出题</button>
+      <button class="btn btn-sm btn-ghost" data-action="calcCoverage">${icon('refresh', 13)} 重新计算</button>
+    </div>
+  </section>`;
+}
+
+/** 生词表 → 词库条目（ECDICT 释义优先，内置高考词库兜底） */
+function unknownEntries(data) {
+  return (data && data.unknownWords ? data.unknownWords : []).map((w) => {
+    const b = builtinLookup(w.term);
+    return {
+      term: w.term,
+      phonetic: w.phonetic || b?.phonetic || '',
+      pos: b?.pos || '',
+      meaning: w.meaning || b?.meaning || '',
+      source: { type: 'article', articleId: currentId, at: new Date().toISOString() }
+    };
+  }).filter((w) => w.term);
+}
+
+function quizFromUnknown(data) {
+  const entries = unknownEntries(data).slice(0, 20);
+  if (!entries.length) { toast('这篇没有可用于出题的生词', 'info'); return; }
+  addWords(entries);
+  const terms = new Set(entries.map((e) => normalizeTerm(e.term)));
+  const list = getState().words.filter((w) => terms.has(normalizeTerm(w.term))).slice(0, 20);
+  if (list.length < 2) { toast('生词不足 2 个，无法生成试卷', 'error'); return; }
+  const quiz = {
+    id: `q_${Date.now().toString(36)}`, date: dateKey(),
+    createdAt: new Date().toISOString(), status: 'draft',
+    targetWordIds: list.map((w) => w.id), passage: null, questions: [], focus: '文章生词'
+  };
+  saveQuiz(quiz);
+  go('quiz', { mode: 'take', id: quiz.id });
+}
+
+/** 列表页后台补算覆盖率：只更新徽章，不整页刷新 */
+async function ensureListCoverage() {
+  const articles = getState().articles.slice(0, 20);
+  for (const a of articles) {
+    if (mode !== 'list') return;
+    const hash = articleHash(a.text);
+    if (a.coverage && a.coverage.hash === hash) continue;
+    try {
+      const dictInfo = await fetchDictBatch(scanWords(a.text).map((t) => t.key)).catch(() => ({}));
+      if (mode !== 'list') return;
+      const summary = coverageSummary(computeCoverage(a.text, buildKnownSet(getState().words), dictInfo, a.hardSentences || []));
+      patchArticle(a.id, { coverage: summary });
+      const el = document.querySelector(`[data-cov-badge="${a.id}"]`);
+      if (el) {
+        el.textContent = `${summary.label} · 读懂 ${Math.round(summary.knownRatio * 100)}%`;
+        el.className = `pill ${summary.level >= 4 ? 'danger' : summary.level >= 3 ? 'warn' : 'success'}`;
+      }
+    } catch (_) { /* 词典不可用不影响阅读 */ }
+  }
 }
 
 function renderImportPanel() {
@@ -237,10 +407,20 @@ function renderRead() {
   const sentences = flattenSentences(struct);
   const hardList = Array.isArray(a.hardSentences) ? a.hardSentences : [];
   const hardMap = new Map(hardList.map((h) => [h.index, h]));
+  const cov = currentCoverage(a);
+  const stored = a.coverage && a.coverage.hash === articleHash(a.text) ? a.coverage : null;
+  const shown = cov || stored;
+  const vocab = matchArticleVocab(a.text);
+  const unknownSet = showUnknown && cov ? unknownSurfaceSet(cov) : null;
+  const coreSet = showCore ? vocab.surfaces : null;
+  const rv = readingData(a);
+  const vocabTotal = vocab.coreCount + vocab.extraCount;
   return `
-    <div class="row" style="margin-bottom:14px">
+    <div class="row reader-actions" style="margin-bottom:14px">
       <button class="btn btn-sm" data-action="backList">${icon('arrowLeft', 14)} 文章列表</button>
       <div style="flex:1"></div>
+      ${cov ? `<button class="btn btn-sm ${showUnknown ? 'btn-primary' : ''}" data-action="toggleUnknown" title="标出未掌握的词">
+        ${icon('highlighter', 13)} ${showUnknown ? '隐藏生词' : '生词高亮'}</button>` : ''}
       <button class="btn btn-sm" data-action="articleAnalysis" ${analysisBusy ? 'disabled' : ''}>
         ${analysisBusy ? '<span class="loading"></span>' : `${icon('sparkles', 14)} ${a.analysis ? '重新分析' : 'AI 分析全文'}`}</button>
       <button class="btn btn-sm" data-speak-article="${a.id}" title="从头朗读全文">${icon('volume', 14)} 听全文</button>
@@ -258,7 +438,7 @@ function renderRead() {
               const has = a.sentences && a.sentences[idx];
               const hard = hardMap.get(idx);
               const tip = hard ? `长难句 · ${hard.reason || ''}｜点这句开始精读` : '点这句，先自己翻，AI 再给提示';
-              return `<span class="sentence ${idx === activeIndex ? 'active' : ''} ${has ? 'explained' : ''} ${hard ? 'hard-sentence' : ''}" data-si="${idx}" title="${esc(tip)}">${esc(s)}<button class="tts-btn tts-inline" type="button" data-speak="${esc(s)}" title="听这句" aria-label="听这句：${esc(s.slice(0, 40))}">${icon('volume', 13)}</button></span>`;
+              return `<span class="sentence ${idx === activeIndex ? 'active' : ''} ${has ? 'explained' : ''} ${hard ? 'hard-sentence' : ''}" data-si="${idx}" title="${esc(tip)}">${highlightSentence(s, { unknown: unknownSet, core: coreSet })}<button class="tts-btn tts-inline" type="button" data-speak="${esc(s)}" title="听这句" aria-label="听这句：${esc(s.slice(0, 40))}">${icon('volume', 13)}</button></span>`;
             }).join(' ')}</p>`).join('')}
         </article>
         <div class="selection-bar" id="selBar">
@@ -266,31 +446,298 @@ function renderRead() {
           ${selectionText ? `<button class="btn btn-sm" data-action="translateSel">${icon('chat', 13)} 翻译选中</button>` : ''}
           ${selectionText ? `<button class="btn btn-sm btn-primary" data-action="explainSel">${icon('sparkles', 13)} 精读选中</button>` : ''}
         </div>
-        <div class="tiny muted mt8">共 ${sentences.length} 句 · ${countWordsEn(a.text)} 词 · 紫色下划线是本地 NLP 挑出的长难句</div>
+        <div class="tiny muted mt8">共 ${sentences.length} 句 · ${countWordsEn(a.text)} 词 · 紫色下划线是本地 NLP 挑出的长难句${vocabTotal ? ` · 词表命中 ${vocabTotal} 词` : ''}${shown ? ` · 生词 ${shown.unknown} 个 · 读懂约 ${Math.round(shown.knownRatio * 100)}%` : ''}</div>
       </div>
 
-      <div>
-        ${renderHardCard(a, hardList)}
-        ${renderStructCard()}
-        ${renderBacktransCard(a)}
-        ${renderExplanationPanel()}
-        ${a.analysis ? renderAnalysis(a.analysis) : ''}
+      <div class="study-col">
+        ${renderStudyTabs(a, vocab, rv)}
+        <div class="study-panel" id="studyPanel">
+          ${renderStudyPanel(a, { vocab, hardList, cov, rv })}
+        </div>
       </div>
     </div>
   `;
 }
 
-/** 结构树卡片：点句子 → 右侧出现依存树 / 成分树 */
-function renderStructCard() {
-  const body = activeIndex >= 0
-    ? structPanelHTML(activeNlp, { loading: !activeNlp })
-    : `<div class="empty" style="padding:26px 0">${icon('layers', 26)}<p>点正文里的任意一句，这里会出现它的结构树</p></div>`;
-  return `<section class="card mb16" id="structCard">
-    <div class="card-head"><div><h2>结构树</h2>
-      <div class="sub">${activeIndex >= 0 ? `第 ${activeIndex + 1} 句 · 悬停节点高亮原文，点 ▾ 折叠从句` : '依存树 / 成分树，只画结构不标词性'}</div></div>${icon('layers', 18)}</div>
-    <div data-struct-host>${body}</div>
+/* ---------- 阅读理解的本地作答状态 ---------- */
+
+function readingData(a) {
+  const hash = articleHash(a.text);
+  const questions = a.reading && a.reading.hash === hash && Array.isArray(a.reading.questions) ? a.reading.questions : [];
+  const result = a.readingResult && a.readingResult.hash === hash ? a.readingResult : null;
+  if (reading.articleId !== a.id) {
+    reading = {
+      articleId: a.id,
+      answers: result ? Object.assign({}, result.answers || {}) : {},
+      submitted: !!result,
+      busy: false,
+      error: '',
+      score: result ? { correct: result.correct, total: result.total } : null
+    };
+  }
+  return { hash, questions, result };
+}
+
+const STUDY_TABS = [
+  ['vocab', '词汇'],
+  ['hard', '长难句'],
+  ['reading', '阅读理解'],
+  ['deep', '精讲']
+];
+
+function renderStudyTabs(a, vocab, rv) {
+  const counts = {
+    vocab: vocab.coreCount + vocab.extraCount,
+    hard: (a.hardSentences || []).length,
+    reading: rv.result ? `${rv.result.correct}/${rv.result.total}` : (rv.questions.length || ''),
+    deep: 0
+  };
+  return `<div class="study-tabs" role="tablist" aria-label="文章学习分区">
+    ${STUDY_TABS.map(([key, label]) => `
+      <button class="study-tab ${studyTab === key ? 'active' : ''}" data-action="studyTab" data-tab="${key}" role="tab" aria-selected="${studyTab === key}" type="button">
+        <span>${label}</span>${counts[key] ? `<em>${counts[key]}</em>` : ''}
+      </button>`).join('')}
+  </div>`;
+}
+
+function renderStudyPanel(a, { vocab, hardList, cov, rv }) {
+  if (studyTab === 'hard') return renderHardCard(a, hardList);
+  if (studyTab === 'reading') return renderReadingCard(a, rv);
+  if (studyTab === 'deep') {
+    return `${renderBacktransCard(a)}${renderExplanationPanel()}${a.analysis ? renderAnalysis(a.analysis) : ''}`;
+  }
+  return `${renderVocabCard(a, vocab)}${renderCoverageCard(a, cov)}`;
+}
+
+/* ---------- 第一部分：词汇（词表命中 + 背诵引导） ---------- */
+
+function vocabRow(w, i) {
+  return `<div class="vocab-row">
+    <div class="vocab-main">
+      <div class="vocab-term">${esc(w.term)}${w.phonetic ? `<span class="vocab-ph">${esc(w.phonetic)}</span>` : ''}</div>
+      <div class="vocab-mean">${esc(w.meaning || '暂无释义')}</div>
+    </div>
+    <div class="vocab-side">
+      <span class="tiny muted">×${w.count}</span>
+      <button class="tts-btn" type="button" data-speak="${esc(w.term)}" title="听发音" aria-label="听 ${esc(w.term)}">${icon('volume', 13)}</button>
+      <button class="btn btn-sm btn-ghost" data-action="addVocabWord" data-i="${i}" title="加入词库">${icon('plus', 13)}</button>
+    </div>
+  </div>`;
+}
+
+function renderVocabCard(a, vocab) {
+  const total = vocab.coreCount + vocab.extraCount;
+  const core = vocabShowAll ? vocab.core : vocab.core.slice(0, 12);
+  const extra = vocabShowAll ? vocab.extra : vocab.extra.slice(0, 6);
+  const inBook = new Set(getState().words.map((w) => normalizeTerm(w.term)));
+  const newCount = [...vocab.core, ...vocab.extra].filter((w) => !inBook.has(normalizeTerm(w.term))).length;
+
+  return `<section class="card mb16" id="vocabCard">
+    <div class="card-head">
+      <div><h2>词汇 <span class="pill">${total}</span></h2>
+        <div class="sub">对照《高中核心词汇1000+高考超纲词》：核心 ${vocab.coreCount} 词 · 超纲 ${vocab.extraCount} 词 · 按文中出现顺序</div></div>
+      ${icon('bookOpen', 18)}
+    </div>
+    <div class="row vocab-actions">
+      <button class="btn btn-primary btn-sm" data-action="learnVocab" ${total ? '' : 'disabled'}>${icon('play', 13)} 背诵本文词 (${total})</button>
+      <button class="btn btn-sm" data-action="addAllVocab" ${newCount ? '' : 'disabled'}>${icon('plus', 13)} 全部加入词库${newCount ? ` (${newCount})` : ''}</button>
+      <button class="btn btn-sm ${showCore ? 'btn-primary' : ''}" data-action="toggleCoreVocab">${icon('highlighter', 13)} ${showCore ? '隐藏标注' : '标注原文'}</button>
+    </div>
+
+    ${total ? `
+      <div class="mt16">${core.map((w, i) => vocabRow(w, i)).join('')}</div>
+      ${vocab.coreCount > core.length && !vocabShowAll ? `<button class="btn btn-sm btn-ghost mt8" data-action="vocabMore">还有 ${vocab.coreCount - core.length} 个核心词，展开</button>` : ''}
+      ${vocab.extra.length ? `<div class="vocab-sub">超纲词</div>
+        <div>${extra.map((w, i) => vocabRow(w, vocab.core.length + i)).join('')}</div>
+        ${vocab.extraCount > extra.length && !vocabShowAll ? `<button class="btn btn-sm btn-ghost mt8" data-action="vocabMore">还有 ${vocab.extraCount - extra.length} 个超纲词，展开</button>` : ''}` : ''}
+    ` : `<div class="empty" style="padding:26px 0">${icon('bookOpen', 26)}<p>这篇没有命中词表词汇，可以先用「生词覆盖」把不认识的词收进词库。</p></div>`}
+
+    <div class="feedback mt16">${icon('info', 13)} 「背诵本文词」在弹窗里完成，进度与词库、背单词页共用同一份记录；答错的词会进入背单词页的「阅读错词」。</div>
   </section>`;
 }
+
+/* ---------- 背诵本文词：弹窗卡片（与背单词页共用进度） ---------- */
+
+function drillPromptHTML(q) {
+  if (q.mode === 'w2m') {
+    return `<div class="learn-word">${esc(q.word.term)}<button class="tts-btn" type="button" data-speak="${esc(q.word.term)}" title="听发音" aria-label="听 ${esc(q.word.term)} 的发音">${icon('volume', 18)}</button></div>
+      <div class="learn-phonetic">${esc(q.word.phonetic || builtinLookup(q.word.term)?.phonetic || '')}</div>
+      <div class="learn-hint">选出正确的中文释义</div>`;
+  }
+  return `<div class="learn-meaning">${esc(q.word.meaning)}</div>
+    <div class="learn-hint">选出对应的英文单词</div>`;
+}
+
+function drillBody(s) {
+  if (s.done) {
+    const total = s.queue.length;
+    const acc = total ? Math.round((s.right / total) * 100) : 0;
+    return `<div class="drill-summary">
+      <div class="learn-mode">本轮完成</div>
+      <div class="drill-score">${acc}<span>%</span></div>
+      <div class="sub">${total} 词 · 答对 ${s.right}</div>
+      ${s.wrong.length
+        ? `<div class="drill-wrong">${s.wrong.map((w) => `<span class="drill-chip"><b>${esc(w.term)}</b>${esc(w.meaning)}</span>`).join('')}</div>`
+        : `<div class="feedback mt12">${icon('check', 13)} 全对，本文词汇已经过了一遍。</div>`}
+      <div class="row mt16" style="justify-content:center">
+        <button class="btn btn-primary btn-sm" data-drill="again" type="button">${icon('refresh', 13)} 再来一轮</button>
+        <button class="btn btn-sm" data-close type="button">完成</button>
+      </div>
+    </div>`;
+  }
+
+  const q = s.queue[s.idx];
+  const pct = Math.round((s.idx / s.queue.length) * 100);
+  const options = q.options.map((o, i) => {
+    let cls = '';
+    if (s.answered) {
+      if (o === q.answer) cls = 'right';
+      else if (o === s.answered.choice) cls = 'wrong';
+      else cls = 'dim';
+    }
+    return `<button class="learn-option ${cls}" data-drill="pick" data-i="${i}" type="button" ${s.answered ? 'disabled' : ''}>
+      <span class="learn-opt-key">${'ABCD'[i]}</span><span>${esc(o)}</span></button>`;
+  }).join('');
+  const feedback = s.answered ? `<div class="learn-feedback ${s.answered.ok ? 'ok' : 'no'}">
+      <b>${s.answered.ok ? '回答正确' : '再记一下'}</b>
+      <div><b>${esc(q.word.term)}</b> ${esc(q.word.phonetic || '')} —— ${esc(q.word.meaning)}</div>
+      <button class="btn btn-primary btn-sm mt12" data-drill="next" type="button">${s.idx + 1 >= s.queue.length ? '查看结果' : '下一个'} ${icon('arrowRight', 13)}</button>
+    </div>` : '';
+
+  return `<div class="drill-top">
+      <div class="learn-progress"><div class="learn-progress-bar" style="width:${pct}%"></div></div>
+      <span class="tiny muted">${s.idx + 1} / ${s.queue.length}</span>
+    </div>
+    <div class="learn-card">
+      <div class="learn-mode">${q.mode === 'w2m' ? '看词选义' : '看义选词'}</div>
+      ${drillPromptHTML(q)}
+      <div class="learn-options">${options}</div>
+      ${feedback}
+    </div>`;
+}
+
+function openVocabDrill(article) {
+  if (!article) return;
+  const v = matchArticleVocab(article.text);
+  const byTerm = new Map(getState().words.map((w) => [String(w.term || '').toLowerCase(), w]));
+  const words = [...v.core, ...v.extra].map((w) => ({
+    term: w.term,
+    phonetic: w.phonetic || '',
+    pos: '',
+    meaning: w.meaning,
+    example: '',
+    ref: byTerm.get(String(w.term).toLowerCase()) || null
+  }));
+  if (!words.length) { toast('这篇没有命中词表的词', 'info'); return; }
+
+  const session = { queue: buildQueue(words, words.length), idx: 0, right: 0, wrong: [], answered: null, done: false };
+  modal({
+    title: `背诵本文词 · ${words.length} 词`,
+    wide: true,
+    body: '<div class="drill-wrap" data-drill-host></div>',
+    actions: [{ label: '关闭', value: null }],
+    onMount: (overlay) => {
+      const host = overlay.querySelector('[data-drill-host]');
+      const box = overlay.querySelector('.modal');
+      box.classList.add('modal-drill');
+      const paint = () => { host.innerHTML = drillBody(session); box.scrollTop = 0; };
+      paint();
+      overlay.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-drill]');
+        if (!btn) return;
+        const act = btn.dataset.drill;
+        if (act === 'pick') {
+          if (session.answered) return;
+          const q = session.queue[session.idx];
+          const choice = q.options[Number(btn.dataset.i)];
+          const ok = choice === q.answer;
+          session.answered = { ok, choice };
+          if (ok) session.right++; else session.wrong.push(q.word);
+          applyAnswer(q.word, ok, 'article');
+          paint();
+        } else if (act === 'next') {
+          session.answered = null;
+          session.idx++;
+          if (session.idx >= session.queue.length) session.done = true;
+          paint();
+        } else if (act === 'again') {
+          session.queue = buildQueue(words, words.length);
+          session.idx = 0; session.right = 0; session.wrong = []; session.answered = null; session.done = false;
+          paint();
+        }
+      });
+    }
+  });
+}
+
+/* ---------- 第三部分：阅读理解（4 题，1 主旨 + 3 细节/推理/态度/词义） ---------- */
+
+const RQ_TYPE_LABEL = { main: '主旨理解', detail: '细节理解', inference: '推理判断', attitude: '态度观点', vocab: '词义猜测' };
+
+function renderReadingCard(a, rv) {
+  if (reading.busy) {
+    return `<section class="card mb16"><div class="card-head"><div><h2>阅读理解</h2><div class="sub">AI 正在按北京卷 C/D 篇难度命题…</div></div></div>
+      <div class="empty" style="padding:30px 0"><span class="loading"></span><p>通常需要 10-40 秒</p></div></section>`;
+  }
+
+  if (!rv.questions.length) {
+    return `<section class="card mb16">
+      <div class="card-head"><div><h2>阅读理解</h2><div class="sub">4 道单选题：1 道主旨 + 3 道细节 / 推理 / 态度 / 词义，难度对标北京卷 C/D 篇</div></div>${icon('clipboard', 18)}</div>
+      <div class="empty" style="padding:20px 0">
+        ${icon('sparkles', 26)}
+        <p>${reading.error ? esc(reading.error) : '这篇还没有阅读理解题。生成后会自动缓存，正文不变不重复出题。'}</p>
+        <button class="btn btn-primary btn-sm" data-action="genReading">${icon('sparkles', 13)} ${reading.error ? '重试生成' : '生成 4 道阅读题'}</button>
+      </div>
+    </section>`;
+  }
+
+  const submitted = reading.submitted;
+  const score = reading.score;
+  return `<section class="card mb16">
+    <div class="card-head">
+      <div><h2>阅读理解 <span class="pill">${rv.questions.length} 题</span></h2>
+        <div class="sub">北京卷 C/D 篇难度${submitted && score ? ` · 本次 ${score.correct} / ${score.total} 正确` : ' · 选完后提交，逐题看解析'}</div></div>
+      <button class="btn btn-sm btn-ghost" data-action="genReading" ${submitted ? '' : 'disabled'} title="重新命题">${icon('refresh', 13)} 换一套</button>
+    </div>
+
+    ${rv.questions.map((q, qi) => {
+      const chosen = reading.answers[q.id];
+      return `<div class="rq">
+        <div class="rq-head">
+          <span class="q-index">${qi + 1}</span>
+          <span class="pill ${q.type === 'main' ? 'primary' : ''}">${RQ_TYPE_LABEL[q.type] || '理解'}</span>
+          ${submitted ? `<span class="rq-state ${Number(chosen) === q.answer ? 'ok' : 'no'}">${Number(chosen) === q.answer ? '正确' : '需复习'}</span>` : ''}
+        </div>
+        <p class="rq-stem">${esc(q.stem)}</p>
+        <div class="rq-options">
+          ${q.options.map((opt, i) => {
+            let cls = '';
+            if (submitted) cls = i === q.answer ? 'right' : (i === Number(chosen) ? 'wrong' : 'dim');
+            else if (i === Number(chosen)) cls = 'selected';
+            return `<button type="button" class="rq-option ${cls}" data-action="rqPick" data-q="${esc(q.id)}" data-i="${i}" ${submitted ? 'disabled' : ''}>
+              <span class="rq-key">${'ABCD'[i]}</span><span class="rq-text">${esc(opt)}</span></button>`;
+          }).join('')}
+        </div>
+        ${submitted ? `<div class="rq-explain">
+          <div>${icon('info', 13)} ${esc(q.explain || '暂无解析')}</div>
+          ${q.anchor?.anchored ? `<button class="btn btn-sm btn-ghost mt8" data-action="jumpSentence" data-si="${q.anchor.sentenceIndex}">${icon('reader', 12)} 回到原文依据</button>` : ''}
+        </div>` : ''}
+      </div>`;
+    }).join('')}
+
+    <div class="rq-foot">
+      ${submitted
+        ? `<div class="rq-score ${score && score.correct === score.total ? 'ok' : ''}">${score ? score.correct : 0} / ${score ? score.total : rv.questions.length}</div>
+           <div class="row">
+             <button class="btn btn-sm" data-action="retryReading">${icon('refresh', 13)} 再做一遍</button>
+             <button class="btn btn-sm btn-ghost" data-action="learnVocab">${icon('target', 13)} 去背本文词</button>
+           </div>`
+        : `<button class="btn btn-primary" data-action="submitReading">${icon('check', 14)} 提交批改</button>
+           <span class="tiny muted">已选 ${Object.keys(reading.answers).length} / ${rv.questions.length}</span>`}
+    </div>
+  </section>`;
+}
+
 
 /** 回译练习：只列已经精读过的句子（有中文译文才能遮住原文） */
 function renderBacktransCard(a) {
@@ -356,6 +803,7 @@ function renderExplanationPanel() {
       ${!c.analysis && (c.turns.length || c.busy) ? `<div class="coach-thread">${coachTurnsHtml(c)}${c.busy ? coachTypingHtml(c) : ''}</div>` : ''}
       ${c.analysis ? renderCoachAnalysis(c) : `
         ${c.cached && !c.turns.length && !c.busy ? '' : `<div class="coach-input">
+          ${!c.turns.length ? `<div class="coach-freewrite">${icon('highlighter', 13)} 先自己翻，AI 不会提前提示；写完交给老师，卡住再点「给点提示」。</div>` : ''}
           <textarea class="textarea" id="coachInput" placeholder="用中文把这句话的意思写出来，卡住的地方可以先跳过…">${esc(c.draft)}</textarea>
           <div class="row" style="margin-top:10px">
             <button class="btn btn-primary" data-action="coachSend" ${c.busy ? 'disabled' : ''}>${icon('chat', 13)} 交给老师看</button>
@@ -517,6 +965,7 @@ function saveNewArticle({ title, text, source }) {
   showImport = false; importDraft = { title: '', text: '', source: '', photos: [], fileName: '', hint: '', ebook: null, ebookFile: null };
   refreshMe();
   ensureHardSentences(a.id);
+  ensureCoverage(a);
 }
 
 function toWordEntries(words, sourceType) {
@@ -634,6 +1083,7 @@ function openCoach(index, sentenceOverride = '') {
     coach.fromCache = true;
   }
   activeIndex = index;
+  studyTab = 'deep';          // 点句子 → 自动切到「精讲」分区
   activeNlp = (index >= 0 && a.sentences?.[index]?.nlp) || null;
   refreshKeep();
   scrollCoachIntoView();
@@ -651,28 +1101,7 @@ function openCoach(index, sentenceOverride = '') {
   } else {
     coach.nlp = activeNlp;
   }
-
-  if (!coach.cached) startCoach();
-}
-
-async function startCoach() {
-  const c = coach;
-  if (!c) return;
-  c.busy = true; c.error = ''; refreshKeep();
-  try {
-    const r = await coachSentence({ sentence: c.sentence, context: c.context, mode: 'open', attempt: 0, nlp: c.nlp });
-    if (coach !== c) return;
-    c.turns.push({ role: 'coach', text: r.reply, focus: r.focus, question: r.question, stage: r.stage });
-    c.busy = false;
-    if (r.analysis) finishCoach(r.analysis);
-  } catch (err) {
-    if (coach !== c) return;
-    c.busy = false;
-    c.error = `AI 暂时没回话：${err.message}`;
-    c.turns.push({ role: 'coach', text: '先别看答案，试着用中文把这句话的意思写出来，能写多少写多少，写完发给我。' });
-  }
-  persistCoachTurns(c);
-  refreshKeep();
+  // 不再自动让 AI 开场：先让学生自己翻，需要提示时再点「给点提示」
 }
 
 async function runCoachTurn({ translation = '', mode = 'answer' } = {}) {
@@ -743,16 +1172,41 @@ function finishCoach(analysis) {
 /* ---------- 渲染入口 ---------- */
 
 export function render(params = {}) {
+  const prevId = currentId;
   // 支持从首页直接打开某一篇：#/reader?id=xxx
-  if (params.id) {
+  // 路由里的 id 只消费一次：否则用户在列表里换文章后，刷新会把 currentId 拽回旧文章
+  if (params.id && params.id !== routeIdConsumed) {
     const a = getArticle(params.id);
     if (a) { currentId = a.id; mode = 'read'; }
+    routeIdConsumed = params.id;
   }
+  if (!params.id) routeIdConsumed = '';
+
+  if (currentId !== prevId) {
+    reading = { articleId: null, answers: {}, submitted: false, busy: false, error: '', score: null };
+    vocabShowAll = false;
+    if (!params.tab) studyTab = 'vocab';
+  }
+  // 首页「复习」深链：直接落到指定分区
+  if (params.tab && STUDY_TABS.some(([k]) => k === params.tab)) {
+    if (params.tab !== tabFromRoute) { studyTab = params.tab; tabFromRoute = params.tab; }
+  } else {
+    tabFromRoute = '';
+  }
+
   return mode === 'read' && currentId ? renderRead() : renderList();
 }
 
 export function mount() {
   const view = document.getElementById('view');
+
+  // 进入阅读页自动统计生词；列表页在后台补算各文章难度徽章
+  if (mode === 'read' && currentId) {
+    const art = getArticle(currentId);
+    if (art) ensureCoverage(art);
+  } else if (mode === 'list') {
+    ensureListCoverage();
+  }
 
   // 导入面板：输入时实时更新 draft 与按钮状态（避免整页刷新丢焦点）
   const impText = view.querySelector('#impText');
@@ -804,9 +1258,15 @@ export function mount() {
     }
   }
 
-  // 结构树交互：页签、折叠、悬停高亮
-  const structCard = view.querySelector('#structCard');
-  if (structCard) mountStructPanel(structCard);
+  // 首页「复习」深链：#/reader?id=xxx&si=3 → 渲染后直接打开该句精讲（只消费一次）
+  const params = (getRoute() || {}).params || {};
+  if (params.si !== undefined && params.si !== '' && !siConsumed) {
+    siConsumed = true;
+    const idx = Number(params.si);
+    if (Number.isFinite(idx) && idx >= 0) { openCoach(idx); return; }
+  } else if (params.si === undefined) {
+    siConsumed = false;
+  }
 
   view.addEventListener('click', async (e) => {
     const sentenceEl = e.target.closest('.sentence');
@@ -821,7 +1281,16 @@ export function mount() {
     const btn = e.target.closest('[data-action]');
     if (!btn) {
       const card = e.target.closest('[data-article]');
-      if (card) { currentId = card.dataset.article; mode = 'read'; activeIndex = -1; coach = null; selectionText = ''; refreshMe(); ensureHardSentences(currentId); }
+      if (card) {
+        currentId = card.dataset.article; mode = 'read'; activeIndex = -1; coach = null; selectionText = '';
+        coverage = { articleId: null, hash: '', data: null, loading: false, error: '' };
+        showUnknown = false;
+        studyTab = 'vocab'; vocabShowAll = false;
+        reading = { articleId: null, answers: {}, submitted: false, busy: false, error: '', score: null };
+        refreshMe();
+        ensureHardSentences(currentId);
+        ensureCoverage(getArticle(currentId));
+      }
       return;
     }
     const a = btn.dataset.action;
@@ -868,6 +1337,98 @@ export function mount() {
     if (a === 'goHistory') { go('history'); return; }
     if (a === 'hardItem') { openCoach(Number(btn.dataset.i)); return; }
     if (a === 'jumpSentence') { jumpToSentence(Number(btn.dataset.si)); return; }
+
+    /* ----- 学习分区：词汇 / 长难句 / 阅读理解 / 精讲 ----- */
+    if (a === 'studyTab') {
+      studyTab = btn.dataset.tab || 'vocab';
+      refreshKeep();
+      if (window.innerWidth <= 900) {
+        setTimeout(() => document.getElementById('studyPanel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 40);
+      }
+      return;
+    }
+    if (a === 'toggleCoreVocab') { showCore = !showCore; refreshKeep(); return; }
+    if (a === 'vocabMore') { vocabShowAll = true; refreshKeep(); return; }
+    if (a === 'learnVocab') { openVocabDrill(getArticle(currentId)); return; }
+    if (a === 'addVocabWord') {
+      const art = getArticle(currentId);
+      if (!art) return;
+      const v = matchArticleVocab(art.text);
+      const w = [...v.core, ...v.extra][Number(btn.dataset.i)];
+      if (!w) return;
+      const r = addWords(articleVocabEntries([w], art.id));
+      logActivity(dateKey(), { wordsAdded: r.added });
+      toast(r.added ? `已加入「${w.term}」` : `「${w.term}」已在词库中`, 'success');
+      return;
+    }
+    if (a === 'addAllVocab') {
+      const art = getArticle(currentId);
+      if (!art) return;
+      const v = matchArticleVocab(art.text);
+      const r = addWords(articleVocabEntries([...v.core, ...v.extra], art.id));
+      logActivity(dateKey(), { wordsAdded: r.added });
+      toast(`已加入词库：新增 ${r.added}，更新 ${r.updated}`, 'success');
+      return;
+    }
+    if (a === 'genReading') {
+      const art = getArticle(currentId);
+      if (!art || reading.busy) return;
+      reading.busy = true;
+      reading.error = '';
+      refreshKeep();
+      try {
+        const sents = flattenSentences(splitArticle(art.text)).map((text, index) => ({ index, text }));
+        const questions = await generateReadingQuestions({ title: art.title, text: art.text, sentences: sents });
+        patchArticle(art.id, {
+          reading: { hash: articleHash(art.text), questions, at: new Date().toISOString() },
+          readingResult: null
+        });
+        reading = { articleId: art.id, answers: {}, submitted: false, busy: false, error: '', score: null };
+        toast('阅读理解已生成：4 题', 'success');
+      } catch (err) {
+        reading.busy = false;
+        reading.error = `出题失败：${err.message}`;
+        toast(reading.error, 'error', 5000);
+      }
+      reading.busy = false;
+      refreshKeep();
+      return;
+    }
+    if (a === 'rqPick') {
+      if (reading.submitted) return;
+      reading.answers[btn.dataset.q] = Number(btn.dataset.i);
+      refreshKeep();
+      return;
+    }
+    if (a === 'submitReading') {
+      const art = getArticle(currentId);
+      if (!art) return;
+      const qs = (art.reading && art.reading.hash === articleHash(art.text) && art.reading.questions) || [];
+      if (!qs.length) return;
+      if (Object.keys(reading.answers).length < qs.length) { toast(`还有 ${qs.length - Object.keys(reading.answers).length} 题没选`, 'info'); return; }
+      const correct = qs.filter((q) => Number(reading.answers[q.id]) === q.answer).length;
+      const result = {
+        hash: articleHash(art.text),
+        answers: Object.assign({}, reading.answers),
+        correct,
+        total: qs.length,
+        at: new Date().toISOString()
+      };
+      patchArticle(art.id, { readingResult: result });
+      reading.submitted = true;
+      reading.score = { correct, total: qs.length };
+      logActivity(dateKey(), { questions: qs.length, correct });
+      toast(`阅读理解：${correct} / ${qs.length} 正确`, correct === qs.length ? 'success' : 'info');
+      refreshKeep();
+      return;
+    }
+    if (a === 'retryReading') {
+      reading.answers = {};
+      reading.submitted = false;
+      reading.score = null;
+      refreshKeep();
+      return;
+    }
     if (a === 'backtrans') {
       const art = getArticle(currentId);
       const i = Number(btn.dataset.i);
@@ -885,10 +1446,47 @@ export function mount() {
     }
     if (a === 'redetectHard') { await ensureHardSentences(currentId, { force: true }); toast('已重新识别长难句', 'success'); return; }
     if (a === 'closeImport') { collectImport(); showImport = false; refreshMe(); return; }
-    if (a === 'backList') { mode = 'list'; currentId = null; selectionText = ''; coach = null; activeIndex = -1; refreshMe(); return; }
+    if (a === 'backList') {
+      mode = 'list'; currentId = null; selectionText = ''; coach = null; activeIndex = -1; showUnknown = false;
+      coverage = { articleId: null, hash: '', data: null, loading: false, error: '' };
+      reading = { articleId: null, answers: {}, submitted: false, busy: false, error: '', score: null };
+      refreshMe();
+      return;
+    }
+
+    /* ----- 生词覆盖 ----- */
+    if (a === 'toggleUnknown') { showUnknown = !showUnknown; refreshKeep(); return; }
+    if (a === 'calcCoverage') { await ensureCoverage(getArticle(currentId), { force: true }); return; }
+    if (a === 'addUnknown') {
+      const data = currentCoverage(getArticle(currentId));
+      const w = data?.unknownWords?.[Number(btn.dataset.i)];
+      if (!w) return;
+      const entry = unknownEntries({ unknownWords: [w] })[0];
+      if (!entry) return;
+      const r = addWords([entry]);
+      logActivity(dateKey(), { wordsAdded: r.added });
+      toast(r.added ? `已加入「${w.term}」` : `「${w.term}」已在词库中`, 'success');
+      await ensureCoverage(getArticle(currentId), { force: true });
+      return;
+    }
+    if (a === 'addAllUnknown') {
+      const data = currentCoverage(getArticle(currentId));
+      const entries = unknownEntries(data);
+      if (!entries.length) { toast('没有可加入的生词', 'info'); return; }
+      const r = addWords(entries);
+      logActivity(dateKey(), { wordsAdded: r.added });
+      toast(`已加入词库：新增 ${r.added}，更新 ${r.updated}`, 'success');
+      await ensureCoverage(getArticle(currentId), { force: true });
+      return;
+    }
+    if (a === 'quizUnknown') { quizFromUnknown(currentCoverage(getArticle(currentId))); return; }
 
     /* ----- 对话式精读 ----- */
-    if (a === 'coachStart') { await startCoach(); return; }
+    if (a === 'coachStart') {
+      // 只清掉「上次讲解」的引导，直接进入自己翻的状态（不触发 AI）
+      if (coach) { coach.cached = null; refreshKeep(); }
+      return;
+    }
     if (a === 'coachShowCached') {
       if (!coach?.cached) return;
       coach.analysis = coach.cached; coach.fromCache = true; refreshKeep(); return;
@@ -908,7 +1506,6 @@ export function mount() {
         turns: [], attempts: 0, busy: false, analysis: null, fromCache: false, draft: '', error: ''
       });
       refreshKeep();
-      startCoach();
       return;
     }
     if (a === 'coachHard') {

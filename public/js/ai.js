@@ -5,7 +5,7 @@ import { parseLooseJSON } from './ui.js';
 import { isNative, apiCredentials, nativeAIRequest } from './bridge.js';
 import { nlpSentence, nlpArticle, syntaxHint } from './nlp.js';
 import { profilePrompt } from './profile.js';
-import { anchorItems, normalizeKey } from './anchor.js';
+import { anchorItems, matchItem, normalizeKey } from './anchor.js';
 import { crossCheckAnalysis } from './nlpcross.js';
 
 /** 取当前学习画像摘要；取不到时返回空串，不影响调用 */
@@ -73,7 +73,8 @@ export async function chat(messages, options = {}) {
       return data.choices?.[0]?.message?.content || '';
     } catch (err) {
       lastError = err;
-      const retryable = /429|rate_limit|capacity|500|502|503|timeout|abort/i.test(err.message || '');
+      // 429/容量不足/5xx/超时，以及模型不存在（404、model not found）都换下一个模型重试
+      const retryable = /429|rate_limit|capacity|40[034]|50[0234]|timeout|abort|not\s*found|model[^]{0,20}not|unsupported|overloaded/i.test(err.message || '');
       if (!retryable || i === candidates.length - 1) throw err;
       await new Promise((r) => setTimeout(r, 700 * (i + 1)));
     }
@@ -95,11 +96,12 @@ export async function chatJson(messages, options = {}) {
   return parseLooseJSON(retry);
 }
 
-const TEXT_FALLBACKS = ['Qwen3.8-27B', 'GLM-5.3-Flash', 'MiMo-V2.6-Flash', 'MiniCPM5-2B'];
-const VISION_FALLBACKS = ['Gemma-4-31B-IT', 'Qwen3.8-27B', 'MiMo-V2.6-Flash', 'MiniCPM-V-4.7-35B-A3B'];
+// 主用模型不可用时按顺序回退；前两个是当前网关上的主力模型（Hy4-flash / MiniCPM-V-4.7-35B-A3B）
+const TEXT_FALLBACKS = ['MiniCPM-V-4.7-35B-A3B', 'Hy4-flash', 'Qwen3.8-27B', 'GLM-5.3-Flash', 'MiMo-V2.6-Flash', 'MiniCPM5-2B'];
+const VISION_FALLBACKS = ['Hy4-flash', 'MiniCPM-V-4.7-35B-A3B', 'Gemma-4-31B-IT', 'Qwen3.8-27B', 'MiMo-V2.6-Flash'];
 
 export async function testConnection() {
-  const text = await chat([{ role: 'user', content: '只回复 OK 两个字母。' }], { fallbacks: TEXT_FALLBACKS, max_tokens: 200, temperature: 0, reasoningEffort: 'low' });
+  const text = await chat([{ role: 'user', content: '只回复 OK 两个字母。' }], { fallbacks: TEXT_FALLBACKS, max_tokens: 200, temperature: 0, reasoningEffort: 'none' });
   return text.trim().slice(0, 40);
 }
 
@@ -182,7 +184,7 @@ export async function ocrImage(dataUrl, hint = '') {
         { type: 'image_url', image_url: { url: dataUrl } }
       ]
     }
-  ], { model: s.visionModel, fallbacks: VISION_FALLBACKS, json: true, max_tokens: 4000, temperature: 0.05, reasoningEffort: 'low' });
+  ], { model: s.visionModel, fallbacks: VISION_FALLBACKS, json: true, max_tokens: 4000, temperature: 0.05, reasoningEffort: 'none' });
   const items = Array.isArray(parsed) ? parsed : (parsed.items || parsed.words || []);
   return items.filter((x) => x && String(x.term || '').trim()).slice(0, 60);
 }
@@ -191,7 +193,7 @@ export async function ocrText(rawText) {
   const parsed = await chatJson([
     { role: 'system', content: OCR_SYSTEM },
     { role: 'user', content: `请从以下文本中提取词条：\n\n${rawText.slice(0, 12000)}` }
-  ], { fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 4000, temperature: 0.05, reasoningEffort: 'low' });
+  ], { fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 4000, temperature: 0.05, reasoningEffort: 'none' });
   const items = Array.isArray(parsed) ? parsed : (parsed.items || parsed.words || []);
   return items.filter((x) => x && String(x.term || '').trim()).slice(0, 60);
 }
@@ -247,7 +249,7 @@ export async function generateQuiz({ words, count = 10, focus = '' }) {
       role: 'user',
       content: `请生成 ${count} 道题的今日试卷。\n${focus ? `侧重点：${focus}\n` : ''}词表（JSON）：\n${JSON.stringify(brief)}`
     }
-  ], { model: s.textModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 6000, temperature: 0.45, reasoningEffort: 'low' });
+  ], { model: s.textModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 6000, temperature: 0.45, reasoningEffort: 'none' });
   if (!parsed || !Array.isArray(parsed.questions)) throw new Error('AI 未返回有效试卷，请重试');
   return {
     passage: parsed.passage || { title: '', text: '', translation: '' },
@@ -281,7 +283,7 @@ export async function gradeSubjective(items) {
   const parsed = await chatJson([
     { role: 'system', content: GRADE_SYSTEM },
     { role: 'user', content: `待批改作答（JSON）：\n${JSON.stringify(items)}` }
-  ], { model: s.gradingModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 3000, temperature: 0.1, reasoningEffort: 'low' });
+  ], { model: s.gradingModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 3000, temperature: 0.1, reasoningEffort: 'none' });
   const list = Array.isArray(parsed) ? parsed : (parsed.results || []);
   const map = {};
   list.forEach((r) => { if (r && r.id) map[String(r.id)] = r; });
@@ -292,7 +294,7 @@ export async function generateAdvice(stats) {
   const text = await chat([
     { role: 'system', content: '你是耐心的英语学习教练。根据统计数据给出中文学习建议，使用简短 Markdown（小标题 + 要点），不超过 500 字，语气鼓励、具体可执行。' },
     { role: 'user', content: `学习统计：\n${JSON.stringify(stats)}` }
-  ], { fallbacks: TEXT_FALLBACKS, max_tokens: 1200, temperature: 0.5, reasoningEffort: 'low' });
+  ], { fallbacks: TEXT_FALLBACKS, max_tokens: 1200, temperature: 0.5, reasoningEffort: 'none' });
   return text.trim();
 }
 
@@ -303,7 +305,33 @@ export async function generateReport(stats) {
       content: '你是学习数据分析师。根据用户的英语单词学习数据写出中文分析报告，Markdown 格式，包含：一、整体概览；二、掌握情况；三、薄弱点诊断；四、下阶段计划。数据要具体引用，不少于 400 字，不超过 1200 字。'
     },
     { role: 'user', content: JSON.stringify(stats) }
-  ], { fallbacks: TEXT_FALLBACKS, max_tokens: 2400, temperature: 0.4, reasoningEffort: 'low' });
+  ], { fallbacks: TEXT_FALLBACKS, max_tokens: 2400, temperature: 0.4, reasoningEffort: 'none' });
+  return text.trim();
+}
+
+/**
+ * 口语评测的 AI 点评：基于本机语音服务给出的评分、词级结果与韵律指标。
+ * 只允许复述已有信息，不编造未提供的音素错误。
+ */
+export async function coachSpeaking({ reference, transcript, scores, metrics, words = [], warnings = [] }) {
+  const missed = words.filter((w) => w.status === 'miss').map((w) => w.text).slice(0, 8);
+  const weak = words.filter((w) => w.status === 'weak').map((w) => w.text).slice(0, 8);
+  const data = {
+    目标句: reference,
+    识别转写: transcript,
+    评分: scores,
+    韵律: metrics,
+    漏读词: missed,
+    置信度偏低词: weak,
+    系统提示: warnings
+  };
+  const text = await chat([
+    {
+      role: 'system',
+      content: '你是英语口语教练。根据系统提供的评分、转写和韵律数据，用中文给出 2-3 条具体可执行的改进建议，总字数不超过 160 字。直接输出正文，不要 Markdown 标题或列表符号。只能引用数据中出现的词和指标，不要编造音素发音错误；若发音分为代理值，要提醒用户这是趋势参考。'
+    },
+    { role: 'user', content: JSON.stringify(data, null, 2) }
+  ], { fallbacks: TEXT_FALLBACKS, max_tokens: 800, temperature: 0.4, reasoningEffort: 'none' });
   return text.trim();
 }
 
@@ -335,7 +363,7 @@ export async function ocrArticle(dataUrl, hint = '') {
         { type: 'image_url', image_url: { url: dataUrl } }
       ]
     }
-  ], { model: s.visionModel, fallbacks: VISION_FALLBACKS, json: true, max_tokens: 5000, temperature: 0.05, reasoningEffort: 'low' });
+  ], { model: s.visionModel, fallbacks: VISION_FALLBACKS, json: true, max_tokens: 5000, temperature: 0.05, reasoningEffort: 'none' });
   return {
     title: String(parsed.title || '').trim(),
     text: String(parsed.text || '').trim(),
@@ -371,7 +399,7 @@ ${hint ? `补充：${hint}` : ''}` },
   const parsed = await chatJson([
     { role: 'system', content: '你是英文文章 OCR 助手，按图片顺序转录正文，输出严格 JSON。' },
     { role: 'user', content }
-  ], { model: s.visionModel, fallbacks: VISION_FALLBACKS, json: true, max_tokens: 8000, temperature: 0.05, reasoningEffort: 'low' });
+  ], { model: s.visionModel, fallbacks: VISION_FALLBACKS, json: true, max_tokens: 8000, temperature: 0.05, reasoningEffort: 'none' });
   const pages = Array.isArray(parsed.pages)
     ? parsed.pages.map((p) => String(p.text || '').trim()).filter(Boolean) : [];
   const merged = String(parsed.text || '').trim() || pages.join('\n\n');
@@ -419,7 +447,7 @@ ${learnerContext() ? `4. 学生画像如下，分析难度与词汇取舍要贴�
 ${hint}`
     },
     { role: 'user', content: `标题：${title || '(无标题)'}\n\n正文：\n${String(text).slice(0, 15000)}` }
-  ], { model: s.textModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 6000, temperature: 0.35, reasoningEffort: 'low' });
+  ], { model: s.textModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 6000, temperature: 0.35, reasoningEffort: 'none' });
   const sents = Array.isArray(sentences) && sentences.length ? sentences : null;
   return {
     summary: String(p.summary || ''), theme: String(p.theme || ''),
@@ -433,6 +461,79 @@ ${hint}`
     nlp: nlpResult ? { engine: nlpResult.engine, totalSentences: nlpResult.totalSentences, analyzed: nlpResult.analyzed } : null,
     analyzedAt: new Date().toISOString()
   };
+}
+
+/* ============================================================
+   阅读理解：4 道单选题（1 道主旨 + 3 道细节/推理/词义/态度）
+   ============================================================ */
+
+const READING_SYSTEM = `你是北京高考英语阅读命题人。根据给定英文文章出一套 4 道单选题，难度对标北京卷 C/D 篇，输出严格 JSON：
+{
+  "questions": [
+    {
+      "id": "r1",
+      "type": "main | detail | inference | attitude | vocab",
+      "stem": "英文题干",
+      "options": ["英文选项 A", "英文选项 B", "英文选项 C", "英文选项 D"],
+      "answer": 0,
+      "explain": "中文解析：为什么正确项对，其余三项错在哪",
+      "evidence": "原文中支撑答案的那一句，逐字摘录"
+    }
+  ]
+}
+规则：
+1. 必须正好 4 题。第 1 题固定为 main（主旨大意 / 最佳标题 / 作者写作目的三选一），后 3 题从 detail、inference、attitude、vocab 中选，且至少包含 1 道推理判断、1 道词义猜测或作者态度。
+2. 难度对标北京卷 C/D 篇：题干需要理解句间逻辑与作者言外之意，不能靠关键词直接定位答案。
+3. 干扰项必须基于原文信息设置（张冠李戴、过度推断、以偏概全、偷换程度），不要出现明显荒谬的选项，不要使用 All of the above / None of the above。
+4. 题干与选项全部用英文；正确选项要改写原文，不能整句照抄。四个选项长度尽量接近。
+5. evidence 必须是原文中真实出现的一句（或完整分句），不得改写、不得杜撰；explain 用中文，每条不超过 80 字。
+6. answer 用 0-3 的整数表示正确选项下标。
+7. 只输出 JSON 对象，不要 Markdown 代码块，不要解释。`;
+
+/**
+ * 生成本文的阅读理解题（4 题，含 1 道主旨题）。
+ * @param {object} opts
+ * @param {string} opts.title 标题
+ * @param {string} opts.text 正文
+ * @param {{index:number,text:string}[]} [opts.sentences] 阅读器分句，用于把 evidence 定位回原文
+ */
+export async function generateReadingQuestions({ title, text, sentences = [] }) {
+  const s = getSettings();
+  const p = await chatJson([
+    { role: 'system', content: READING_SYSTEM },
+    { role: 'user', content: `标题：${title || '(无标题)'}\n\n正文：\n${String(text).slice(0, 12000)}` }
+  ], { model: s.textModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 4000, temperature: 0.4, reasoningEffort: 'none' });
+
+  const raw = Array.isArray(p) ? p : (Array.isArray(p.questions) ? p.questions : []);
+  const TYPES = ['main', 'detail', 'inference', 'attitude', 'vocab'];
+  const sents = Array.isArray(sentences) ? sentences : [];
+  const questions = raw.map((q, i) => {
+    if (!q || !String(q.stem || '').trim()) return null;
+    const options = (Array.isArray(q.options) ? q.options : []).map(String).filter((x) => x.trim()).slice(0, 4);
+    if (options.length < 4) return null;
+    let idx = Number(q.answer);
+    if (!Number.isInteger(idx) || idx < 0 || idx > 3) {
+      const a = String(q.answer == null ? '' : q.answer).trim();
+      if (/^[A-Da-d]$/.test(a)) idx = 'ABCD'.indexOf(a.toUpperCase());
+      else idx = options.findIndex((o) => normalizeKey(o) === normalizeKey(a));
+    }
+    if (!Number.isInteger(idx) || idx < 0 || idx > 3) return null;
+    const evidence = String(q.evidence || '').trim();
+    return {
+      id: String(q.id || `r${i + 1}`),
+      type: TYPES.includes(q.type) ? q.type : 'detail',
+      stem: String(q.stem).trim(),
+      options,
+      answer: idx,
+      explain: String(q.explain || '').trim(),
+      evidence,
+      anchor: evidence && sents.length ? matchItem(evidence, sents) : { anchored: false, matchType: null, sentenceIndex: null }
+    };
+  }).filter(Boolean).slice(0, 4);
+
+  if (questions.length < 4) throw new Error('AI 返回的题目不完整，请重试一次');
+  if (!questions.some((q) => q.type === 'main')) questions[0].type = 'main';
+  return questions;
 }
 
 /* ============================================================
@@ -554,7 +655,7 @@ export async function coachSentence({ sentence, context = '', transcript = [], t
   const out = await chat([
     { role: 'system', content: COACH_SYSTEM + fullHint },
     { role: 'user', content: user }
-  ], { model: s.textModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 3200, temperature: 0.35, reasoningEffort: 'low' });
+  ], { model: s.textModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 3200, temperature: 0.35, reasoningEffort: 'none' });
 
   const p = parseLooseJSON(out) || {};
   const stage = ['guide', 'ask', 'analysis'].includes(p.stage) ? p.stage : (mode === 'reveal' ? 'analysis' : 'ask');
@@ -610,7 +711,7 @@ export async function explainWord(term, context = '') {
 ${hint}`
     },
     { role: 'user', content: `单词/短语：${term}\n\n语境（可能为空）：\n${String(context).slice(0, 800)}` }
-  ], { model: s.textModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 4000, temperature: 0.3, reasoningEffort: 'low' });
+  ], { model: s.textModel, fallbacks: TEXT_FALLBACKS, json: true, max_tokens: 4000, temperature: 0.3, reasoningEffort: 'none' });
   return {
     term: String(p.term || term).trim(), phonetic: String(p.phonetic || ''), pos: String(p.pos || ''),
     meanings: Array.isArray(p.meanings) ? p.meanings : [],
@@ -633,7 +734,7 @@ export async function translateSelection(text, context = '') {
   const out = await chat([
     { role: 'system', content: `你是英汉翻译助手。给出所选英文内容的准确中文翻译；若是单词或短语，再附一行用法说明。直接输出中文，不要 Markdown，不要解释你的工作方式。${hint ? '\n\n' + hint + '\n\n翻译时请参考句法分析，确保主干和修饰关系判断正确。' : ''}` },
     { role: 'user', content: `选中内容：${text}\n\n上下文：${String(context).slice(0, 800)}` }
-  ], { fallbacks: TEXT_FALLBACKS, max_tokens: 800, temperature: 0.2, reasoningEffort: 'low' });
+  ], { fallbacks: TEXT_FALLBACKS, max_tokens: 800, temperature: 0.2, reasoningEffort: 'none' });
   const v = out.trim();
   if (v) {
     if (selCache.size > 60) selCache.clear();

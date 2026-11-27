@@ -1,11 +1,12 @@
 // 百词斩式卡片背单词（纯文字，无语音/图片）
 // 看词选义 / 看义选词交替，即时反馈，错词优先，进度落盘。
 
-import { GAOKAO_WORDS, builtinLookup } from '../gaokao.js';
-import { getState, getWords, updateWord, save, logActivity } from '../store.js';
-import { applyReview } from '../srs.js';
-import { icon, esc, toast, dateKey } from '../ui.js';
-import { refresh } from '../router.js';
+import { builtinLookup } from '../gaokao.js';
+import { getWords } from '../store.js';
+import { icon, esc, toast } from '../ui.js';
+import { refresh, getRoute } from '../router.js';
+import { vocabList } from '../article-vocab.js';
+import { learnState, dayStat, shuffle, buildQueue, applyAnswer } from '../drill.js';
 
 let phase = 'home';        // home | study | done
 let queue = [];
@@ -13,94 +14,88 @@ let idx = 0;
 let right = 0;
 let wrongList = [];
 let answered = null;       // { ok, choice }
-let scope = 'gaokao';      // gaokao | mine | mixed
+// 两个范围：阅读错词（阅读 / 练习里答错与到期的词）| 词表的词（1000 核心 + 超纲）
+let scope = 'list';
+let scopeFromRoute = '';
 let startTime = 0;
 
 export const title = '背单词';
 export const subtitle = '卡片速记 · 看词选义 / 看义选词';
 
-/* ---------- 学习进度（存于 state.meta.learn，不新增顶层字段） ---------- */
-function learnState() {
-  const s = getState();
-  if (!s.meta) s.meta = {};
-  if (!s.meta.learn || typeof s.meta.learn !== 'object') {
-    s.meta.learn = { learned: {}, daily: {}, goal: 20 };
-  }
-  if (!s.meta.learn.learned) s.meta.learn.learned = {};
-  if (!s.meta.learn.daily) s.meta.learn.daily = {};
-  return s.meta.learn;
-}
-function today() { return dateKey(); }
-function dayStat() {
-  const st = learnState();
-  const k = today();
-  if (!st.daily[k]) st.daily[k] = { count: 0, right: 0 };
-  return st.daily[k];
-}
-function record(term, ok) {
-  const st = learnState();
-  const key = String(term || '').toLowerCase();
-  const r = st.learned[key] || { seen: 0, right: 0, wrong: 0, lastAt: null };
-  r.seen++; r[ok ? 'right' : 'wrong']++; r.lastAt = new Date().toISOString();
-  st.learned[key] = r;
-  const d = dayStat(); d.count++; if (ok) d.right++;
-  save();
-}
-function learnedScore(w) {
-  const r = learnState().learned[String(w.term || '').toLowerCase()];
-  if (!r) return 0;
-  return r.right - r.wrong * 2 + (r.seen ? 1 : 0);
+/* ---------- 选词与出题 ---------- */
+
+/** 词表的词：范围 = 《高中核心词汇1000+高考超纲词》 */
+function listWords() {
+  const byTerm = new Map(getWords().map((w) => [String(w.term || '').toLowerCase(), w]));
+  return vocabList().map((v) => {
+    const ref = byTerm.get(v.term.toLowerCase()) || null;
+    return {
+      term: v.term, phonetic: v.phonetic || '', pos: '',
+      meaning: v.meaning, example: '', ref, level: v.level
+    };
+  });
 }
 
-/* ---------- 选词与出题 ---------- */
-function myWords() {
-  return getWords().filter((w) => w.term && w.meaning).map((w) => ({
-    term: w.term, phonetic: w.phonetic || '', pos: w.pos || '',
-    meaning: w.meaning, example: w.example || '', ref: w
-  }));
+/** 阅读错词：阅读里答错的词 + 词库中答错/已到期的词 */
+function wrongWords() {
+  const byTerm = new Map(vocabList().map((v) => [v.term.toLowerCase(), v]));
+  const rows = new Map();
+  const learned = learnState().learned || {};
+
+  Object.keys(learned).forEach((term) => {
+    const r = learned[term];
+    if (!r || !r.wrong) return;
+    if (!(r.src === 'article' || r.readingWrong)) return;
+    const entry = byTerm.get(term);
+    if (!entry) return;
+    rows.set(term, {
+      term: entry.term, phonetic: entry.phonetic, pos: '', meaning: entry.meaning,
+      example: '', ref: null, wrong: r.wrong
+    });
+  });
+
+  getWords().forEach((w) => {
+    const key = String(w.term || '').toLowerCase();
+    if (!w.meaning || rows.has(key)) return;
+    const wrong = w.srs?.wrong || 0;
+    const due = (w.srs?.seen || 0) > 0 && String(w.srs?.dueAt || '') <= new Date().toISOString();
+    if (!wrong && !due) return;
+    rows.set(key, {
+      term: w.term, phonetic: w.phonetic || '', pos: w.pos || '',
+      meaning: w.meaning, example: w.example || '', ref: w, wrong
+    });
+  });
+
+  return [...rows.values()].sort((a, b) => (b.wrong || 0) - (a.wrong || 0) || a.term.localeCompare(b.term));
 }
+
 function pool() {
-  const mine = myWords();
-  if (scope === 'mine') return mine;
-  if (scope === 'mixed') {
-    const seen = new Set(mine.map((w) => w.term.toLowerCase()));
-    return [...mine, ...GAOKAO_WORDS.filter((w) => !seen.has(w.term.toLowerCase()))];
-  }
-  return GAOKAO_WORDS.slice();
+  return scope === 'wrong' ? wrongWords() : listWords();
 }
-function shuffle(arr) {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
+
 function makeQueue() {
-  const all = pool().filter((w) => w.term && w.meaning);
+  const all = pool();
   if (!all.length) return [];
+  // 错词可能只有两三个：选项不足时用词表补齐，避免出现 2 选 1
+  const optionPool = all.length >= 5 ? all
+    : [...all, ...listWords().filter((w) => !all.some((x) => x.term.toLowerCase() === w.term.toLowerCase()))];
   const goal = Math.min(learnState().goal || 20, all.length);
-  // 先看错得多 / 没看过的；同分组内打乱
-  const groups = new Map();
-  all.forEach((w) => {
-    const s = learnedScore(w);
-    const g = s < 0 ? 0 : s === 0 ? 1 : 2;
-    if (!groups.has(g)) groups.set(g, []);
-    groups.get(g).push(w);
-  });
-  const picked = [...(groups.get(0) || []).slice(), ...shuffle(groups.get(1) || []), ...shuffle(groups.get(2) || [])].slice(0, goal);
-  return shuffle(picked).map((w, i) => {
-    const others = shuffle(all.filter((o) => o.term.toLowerCase() !== w.term.toLowerCase() && o.meaning && o.meaning !== w.meaning)).slice(0, 3);
-    const mode = i % 2 === 0 ? 'w2m' : 'm2w';
-    const options = mode === 'w2m'
-      ? shuffle([w.meaning, ...others.map((o) => o.meaning)])
-      : shuffle([w.term, ...others.map((o) => o.term)]);
-    return { word: w, mode, options, answer: mode === 'w2m' ? w.meaning : w.term };
+  return buildQueue(all, goal).map((q) => {
+    if (q.options.length >= 4) return q;
+    const others = shuffle(optionPool.filter((o) => o.term.toLowerCase() !== q.word.term.toLowerCase() && o.meaning && o.meaning !== q.word.meaning)).slice(0, 3);
+    const options = q.mode === 'w2m'
+      ? shuffle([q.word.meaning, ...others.map((o) => o.meaning)])
+      : shuffle([q.word.term, ...others.map((o) => o.term)]);
+    return { ...q, options, answer: q.mode === 'w2m' ? q.word.meaning : q.word.term };
   });
 }
+
 function start() {
   queue = makeQueue();
-  if (!queue.length) { toast('当前词库没有可学习的词条，先去导入或切换范围', 'error'); return; }
+  if (!queue.length) {
+    toast(scope === 'wrong' ? '还没有阅读错词，先读一篇、做几道题吧' : '词表没有可学习的词条', 'info');
+    return;
+  }
   idx = 0; right = 0; wrongList = []; answered = null;
   startTime = Date.now();
   phase = 'study';
@@ -109,27 +104,48 @@ function start() {
 
 /* ---------- 渲染 ---------- */
 export function render() {
+  const params = (getRoute() || {}).params || {};
+  // 路由里带 scope 时切到对应范围；key 里带上 t，保证从首页反复深链都能重新生效
+  const key = `${params.scope || ''}|${params.t || ''}`;
+  if (params.scope && key !== scopeFromRoute) {
+    if (params.scope === 'wrong' || params.scope === 'list') scope = params.scope;
+    scopeFromRoute = key;
+    phase = 'home';
+  } else if (!params.scope) {
+    scopeFromRoute = '';
+  }
   if (phase === 'study') return renderStudy();
   if (phase === 'done') return renderDone();
   return renderHome();
 }
 
+function renderScopePicker(wrongCount, listCount) {
+  return `<div class="learn-scope" role="group" aria-label="背诵范围">
+    <button class="learn-scope-btn ${scope === 'wrong' ? 'active' : ''}" data-act="setScope" data-scope="wrong" type="button">
+      <b>阅读错词</b><span>阅读 / 练习里答错、到期的词</span><em>${wrongCount}</em>
+    </button>
+    <button class="learn-scope-btn ${scope === 'list' ? 'active' : ''}" data-act="setScope" data-scope="list" type="button">
+      <b>词表的词</b><span>核心 1000 + 超纲词</span><em>${listCount}</em>
+    </button>
+  </div>`;
+}
+
 function renderHome() {
   const st = learnState();
   const d = dayStat();
-  const words = getWords();
+  const words = pool();
   const learnedCount = Object.keys(st.learned).length;
   const mastered = Object.values(st.learned).filter((r) => r.right >= 2 && r.right > r.wrong).length;
-  const total = scope === 'gaokao' ? GAOKAO_WORDS.length : scope === 'mine' ? words.length : GAOKAO_WORDS.length + words.length;
+  const total = words.length;
   return `
     <div class="learn-hero">
       <div>
         <div class="learn-eyebrow">今日计划</div>
         <h2>每天 ${st.goal || 20} 词，积少成多</h2>
-        <p>卡片速记，看词选义与看义选词交替。点完即出结果，答错的词会优先再出现。</p>
+        <p>卡片速记，看词选义与看义选词交替。点完即出结果，答错的词会优先再出现；阅读器里的「背诵本文词」用的是同一份记录。</p>
+        ${renderScopePicker(wrongWords().length, vocabList().length)}
         <div class="learn-hero-actions">
-          <button class="btn btn-primary" data-act="start">${icon('play', 15)} 开始今日学习</button>
-          <button class="btn" data-act="scope">当前范围：${scopeLabel()}</button>
+          <button class="btn btn-primary" data-act="start" ${total ? '' : 'disabled'}>${icon('play', 15)} 开始今日学习</button>
         </div>
       </div>
       <div class="learn-ring">
@@ -142,7 +158,7 @@ function renderHome() {
       ${stat('今日已学', d.count, `正确 ${d.count ? Math.round(d.right / d.count * 100) : 0}%`, 'book')}
       ${stat('已接触词', learnedCount, `累计练习记录`, 'sparkles')}
       ${stat('已掌握', mastered, '答对 2 次以上', 'target')}
-      ${stat('可用词库', total, scopeLabel(), 'layers')}
+      ${stat('可用词条', total, scopeLabel(), 'layers')}
     </div>
 
     <section class="card mt16">
@@ -160,7 +176,7 @@ function stat(label, value, foot, ico) {
     <div class="stat-value">${value}</div><div class="tiny muted">${esc(foot)}</div></div>`;
 }
 function scopeLabel() {
-  return { gaokao: '高考核心词', mine: '我的词库', mixed: '全部混合' }[scope] || '高考核心词';
+  return scope === 'wrong' ? '阅读错词' : '词表的词';
 }
 
 function renderStudy() {
@@ -238,13 +254,7 @@ function answer(i, q) {
   const ok = choice === q.answer;
   answered = { ok, choice };
   if (ok) right++; else wrongList.push(q.word);
-  record(q.word.term, ok);
-  if (q.word.ref) {
-    updateWord(q.word.ref.id, { srs: applyReview(q.word.ref, ok) });
-  } else {
-    // 高考词不在我的词库里，记入学习记录即可；如要长期复习可一键加入词库
-  }
-  logActivity(today(), { questions: 1, correct: ok ? 1 : 0 });
+  applyAnswer(q.word, ok, scope === 'wrong' ? 'article' : 'list');
   refresh();
 }
 
@@ -257,9 +267,10 @@ export function mount() {
     if (a === 'start') return start();
     if (a === 'home') { phase = 'home'; refresh(); return; }
     if (a === 'quit') { phase = 'home'; refresh(); return; }
-    if (a === 'scope') {
-      const order = ['gaokao', 'mine', 'mixed'];
-      scope = order[(order.indexOf(scope) + 1) % order.length];
+    if (a === 'setScope') {
+      const next = btn.dataset.scope;
+      if (next === 'wrong' || next === 'list') scope = next;
+      phase = 'home';
       refresh(); return;
     }
     if (a === 'choice' && phase === 'study') return answer(Number(btn.dataset.i), queue[idx]);

@@ -16,6 +16,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { URL } = require('url');
 const nlp = require('./nlp-client');
+const speech = require('./speech-client');
 const dict = require('./dict');
 const mdx = require('./mdx');
 const auth = require('./auth');
@@ -155,7 +156,7 @@ function primaryLanUrl() {
 }
 
 function emptyStore() {
-  return { version: 1, words: [], quizzes: [], attempts: [], activity: [], settings: {}, updatedAt: null };
+  return { version: 1, words: [], quizzes: [], attempts: [], activity: [], speakings: [], settings: {}, updatedAt: null };
 }
 
 /* ---------------- 每用户学习数据 ---------------- */
@@ -483,6 +484,13 @@ const server = http.createServer(async (req, res) => {
       send(res, 200, Object.assign({ ok: true }, found));
       return;
     }
+    // 批量查询：文章生词覆盖率用，一次取整篇去重词表
+    if (req.method === 'POST' && p === '/api/dict/batch') {
+      const body = await readJsonBody(req, 1024 * 1024);
+      const words = Array.isArray(body.words) ? body.words : [];
+      send(res, 200, { ok: true, dict: dict.lookupMany(words) });
+      return;
+    }
 
     /* ---------- MDX / MDD 词典（用户导入，需登录） ---------- */
     if (req.method === 'GET' && p === '/api/mdx/status') {
@@ -595,6 +603,52 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     // （maxSentences 的夹取在 nlp-client.analyzeText 内完成：1-200，异常值回退 80）
+
+    // 本地口语评测（录音分析 / ASR / 发音评估 / TTS），服务不可用时明确返回 503
+    if (req.method === 'GET' && p === '/api/speech/status') {
+      send(res, 200, await speech.status());
+      return;
+    }
+    if (req.method === 'POST' && p === '/api/speech/assess') {
+      if (!currentUser) { unauthorized(res); return; }
+      const body = await readJsonBody(req, 24 * 1024 * 1024);
+      const reference = String(body.reference || '').slice(0, 3000);
+      const audio = typeof body.audio === 'string' ? body.audio : '';
+      if (!audio) { send(res, 400, { ok: false, error: '缺少录音数据' }); return; }
+      if (!reference.trim() && body.mode !== 'free') { send(res, 400, { ok: false, error: '缺少跟读文本' }); return; }
+      const result = await speech.assess({
+        audio,
+        reference,
+        mode: body.mode === 'free' ? 'free' : 'shadow',
+        browserTranscript: String(body.browserTranscript || '').slice(0, 5000)
+      }, 180000);
+      if (!result.ok) {
+        send(res, result.status === 503 ? 503 : 502, {
+          ok: false,
+          error: result.error || '语音评测失败',
+          detail: result.data && result.data.error
+        });
+        return;
+      }
+      send(res, 200, result.data);
+      return;
+    }
+    if (req.method === 'POST' && p === '/api/speech/asr') {
+      if (!currentUser) { unauthorized(res); return; }
+      const body = await readJsonBody(req, 24 * 1024 * 1024);
+      const result = await speech.asr({ audio: String(body.audio || '') }, 180000);
+      if (!result.ok) { send(res, result.status === 503 ? 503 : 502, { ok: false, error: result.error }); return; }
+      send(res, 200, result.data);
+      return;
+    }
+    if (req.method === 'POST' && p === '/api/speech/tts') {
+      if (!currentUser) { unauthorized(res); return; }
+      const body = await readJsonBody(req, 64 * 1024);
+      const result = await speech.tts({ text: String(body.text || '').slice(0, 2000) }, 60000);
+      if (!result.ok) { send(res, 501, { ok: false, error: result.error || '本地 TTS 不可用' }); return; }
+      send(res, 200, result.data);
+      return;
+    }
 
     if (req.method === 'GET' && p === '/api/config') {
       send(res, 200, {
@@ -743,9 +797,16 @@ server.listen(PORT, HOST, () => {
       console.log(ok ? '本地 NLP 句法服务: 就绪（句法参考已启用）' : '本地 NLP 句法服务: 不可用（AI 讲解降级为纯 LLM 模式）');
     });
   }, 300);
+  // 本地语音评测服务：延迟启动，避免阻塞主服务；未安装模型时自动降级为韵律评测
+  setTimeout(() => {
+    speech.ensureStarted();
+    speech.waitReady(15000).then((ok) => {
+      console.log(ok ? '本地语音服务: 就绪（口语评测已启用）' : '本地语音服务: 不可用（口语评测需运行 speech\\setup-venv.bat）');
+    });
+  }, 600);
 });
 
-// 优雅关闭时一并关闭 NLP 子进程
+// 优雅关闭时一并关闭 NLP / 语音子进程
 ['SIGINT', 'SIGTERM'].forEach((sig) => {
-  process.on(sig, () => { nlp.shutdown(); server.close(() => process.exit(0)); });
+  process.on(sig, () => { nlp.shutdown(); speech.shutdown(); server.close(() => process.exit(0)); });
 });
