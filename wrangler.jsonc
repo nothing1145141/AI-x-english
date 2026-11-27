@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "wordwise",
+  "name": "ai-x-english",
   "main": "worker.js",
   "compatibility_date": "2026-11-01",
   "assets": {
@@ -12,7 +12,7 @@
   "kv_namespaces": [
     {
       "binding": "WORDWISE_KV",
-      "id": "REPLACE_WITH_KV_NAMESPACE_ID"
+      "id": "72e7cf20c52146548041183feb996c98"
     }
   ],
   "vars": {
