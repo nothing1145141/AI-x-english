@@ -22,9 +22,14 @@ const LOCAL_USER = {
   local: true
 };
 
-const STATE_KEY = `state:${LOCAL_USER.id}`;
+const USERS_KEY = 'users';
 const IMAGE_PREFIX = 'img:';
 const MAX_UPLOAD_BYTES = 15 * 1024 * 1024;
+const SESSION_TTL = 30 * 24 * 60 * 60;
+
+function stateKey(userId) {
+  return `state:${String(userId || LOCAL_USER.id).replace(/[^a-zA-Z0-9_]/g, '')}`;
+}
 
 // 测试用免费额度 Key，直接内置，省去配置；环境变量可覆盖
 const DEFAULTS = {
@@ -73,8 +78,43 @@ export default {
 
 async function route(request, env, url, p) {
   const method = request.method;
+  const user = await currentUser(request, env);
 
-  if (method === 'GET' && p === '/api/auth/me') return json({ ok: true, user: LOCAL_USER });
+  if (method === 'POST' && p === '/api/auth/register') {
+    const body = await readJson(request, 64 * 1024);
+    try {
+      const created = await registerUser(env, body);
+      const token = await createSession(env, created.id);
+      return json({ ok: true, user: publicUser(created) }, 200, { 'Set-Cookie': sessionCookie(token, url) });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 400);
+    }
+  }
+  if (method === 'POST' && p === '/api/auth/login') {
+    const body = await readJson(request, 64 * 1024);
+    try {
+      const hit = await loginUser(env, body);
+      const token = await createSession(env, hit.id);
+      return json({ ok: true, user: publicUser(hit) }, 200, { 'Set-Cookie': sessionCookie(token, url) });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 401);
+    }
+  }
+  if (method === 'POST' && p === '/api/auth/logout') {
+    const token = cookieValue(request, 'ww_session');
+    if (token) await env.WORDWISE_KV.delete('sess:' + token);
+    return json({ ok: true }, 200, { 'Set-Cookie': 'ww_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0' });
+  }
+  if (method === 'POST' && p === '/api/auth/local') {
+    const users = await readUsers(env);
+    if (users.length) return json({ ok: false, error: '账号已启用，请用用户名和密码登录' }, 403);
+    const token = await createSession(env, LOCAL_USER.id);
+    return json({ ok: true, user: LOCAL_USER }, 200, { 'Set-Cookie': sessionCookie(token, url) });
+  }
+  if (method === 'GET' && p === '/api/auth/me') {
+    const users = await readUsers(env);
+    return json({ ok: true, user: user ? publicUser(user) : null, localAvailable: users.length === 0 });
+  }
   if (method === 'GET' && p === '/api/health') {
     return json({ ok: true, time: new Date().toISOString(), dataFile: false, nlp: false, cloud: true });
   }
@@ -87,6 +127,7 @@ async function route(request, env, url, p) {
     return json({
       apiBase: gw.base,
       hasServerKey: !!gw.key,
+      cloud: true,
       textModel: env.WORDWISE_TEXT_MODEL || DEFAULTS.textModel,
       visionModel: env.WORDWISE_VISION_MODEL || DEFAULTS.visionModel,
       gradingModel: env.WORDWISE_GRADING_MODEL || DEFAULTS.gradingModel,
@@ -101,18 +142,21 @@ async function route(request, env, url, p) {
   if (method === 'POST' && p === '/api/ai') return handleAI(request, env);
 
   if (method === 'GET' && p === '/api/data') {
-    const store = await readState(env);
+    if (!user) return json({ ok: false, error: '请先登录' }, 401);
+    const store = await readState(env, user.id);
     return json(store);
   }
   if (method === 'POST' && p === '/api/data') {
+    if (!user) return json({ ok: false, error: '请先登录' }, 401);
     const body = await readJson(request, 32 * 1024 * 1024);
     if (!body || !Array.isArray(body.words)) return json({ error: '数据格式不正确' }, 400);
     body.updatedAt = new Date().toISOString();
-    await env.WORDWISE_KV.put(STATE_KEY, JSON.stringify(body));
+    await env.WORDWISE_KV.put(stateKey(user.id), JSON.stringify(body));
     return json({ ok: true, updatedAt: body.updatedAt });
   }
 
   if (method === 'POST' && p === '/api/upload') {
+    if (!user) return json({ ok: false, error: '请先登录' }, 401);
     const body = await readJson(request, 20 * 1024 * 1024);
     const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s.exec(body.dataUrl || '');
     if (!m) return json({ error: '图片格式不正确' }, 400);
@@ -125,6 +169,7 @@ async function route(request, env, url, p) {
     return json({ ok: true, id, url: `/api/image/${id}`, size: bin.length });
   }
   if (method === 'GET' && p.startsWith('/api/image/')) {
+    if (!user) return json({ ok: false, error: '请先登录' }, 401);
     const name = p.slice('/api/image/'.length);
     if (!/^[A-Za-z0-9._-]+$/.test(name)) return new Response('Not found', { status: 404 });
     const hit = await env.WORDWISE_KV.getWithMetadata(IMAGE_PREFIX + name, { type: 'arrayBuffer' });
@@ -241,12 +286,147 @@ async function handleModels(env, request) {
 
 /* ---------------- 工具 ---------------- */
 
+/* ---------------- 账号与会话（KV） ---------------- */
+
+async function readUsers(env) {
+  const raw = await env.WORDWISE_KV.get(USERS_KEY);
+  if (!raw) return [];
+  try {
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+async function writeUsers(env, list) {
+  await env.WORDWISE_KV.put(USERS_KEY, JSON.stringify(list));
+}
+
+function publicUser(u) {
+  if (!u) return null;
+  return {
+    id: u.id,
+    username: u.username,
+    nickname: u.nickname || u.username,
+    createdAt: u.createdAt,
+    lastLoginAt: u.lastLoginAt || null,
+    local: !u.hash
+  };
+}
+
+function validateAccount({ username, password, nickname }) {
+  const name = String(username || '').trim();
+  if (!/^[A-Za-z0-9_\u4e00-\u9fa5-]{2,20}$/.test(name)) {
+    return '用户名需 2-20 位，只允许中英文、数字、下划线和短横线';
+  }
+  const pw = String(password || '');
+  if (pw.length < 6) return '密码至少 6 位';
+  if (pw.length > 72) return '密码过长';
+  if (nickname && String(nickname).length > 20) return '昵称最多 20 个字';
+  return null;
+}
+
+async function hashPassword(password, saltHex) {
+  const enc = new TextEncoder();
+  const material = await crypto.subtle.importKey('raw', enc.encode(String(password)), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: hexToBytes(saltHex), iterations: 100000, hash: 'SHA-256' },
+    material,
+    256
+  );
+  return bytesToHex(new Uint8Array(bits));
+}
+
+async function registerUser(env, body) {
+  const err = validateAccount(body || {});
+  if (err) throw new Error(err);
+  const name = String(body.username).trim();
+  const users = await readUsers(env);
+  if (users.some((u) => String(u.username).toLowerCase() === name.toLowerCase())) {
+    throw new Error('这个用户名已经被注册了');
+  }
+  const salt = randomHex(16);
+  const user = {
+    id: `u_${randomHex(8)}`,
+    username: name,
+    nickname: String(body.nickname || '').trim() || name,
+    salt,
+    hash: await hashPassword(body.password, salt),
+    createdAt: new Date().toISOString(),
+    lastLoginAt: null
+  };
+  users.push(user);
+  await writeUsers(env, users);
+  return user;
+}
+
+async function loginUser(env, body) {
+  const name = String((body && body.username) || '').trim();
+  const password = String((body && body.password) || '');
+  if (!name || !password) throw new Error('请输入用户名和密码');
+  const users = await readUsers(env);
+  const user = users.find((u) => u && u.hash && String(u.username).toLowerCase() === name.toLowerCase());
+  // 用户不存在时也算一次，避免用响应时间探测账号
+  const salt = user ? user.salt : randomHex(16);
+  const hash = await hashPassword(password, salt);
+  if (!user || hash !== user.hash) throw new Error('用户名或密码不正确');
+  user.lastLoginAt = new Date().toISOString();
+  await writeUsers(env, users);
+  return user;
+}
+
+async function createSession(env, userId) {
+  const token = randomHex(32);
+  await env.WORDWISE_KV.put('sess:' + token, String(userId), { expirationTtl: SESSION_TTL });
+  return token;
+}
+
+async function currentUser(request, env) {
+  const token = cookieValue(request, 'ww_session');
+  if (!token) return null;
+  const userId = await env.WORDWISE_KV.get('sess:' + token);
+  if (!userId) return null;
+  if (userId === LOCAL_USER.id) return LOCAL_USER;
+  const users = await readUsers(env);
+  return users.find((u) => u.id === userId) || null;
+}
+
+function cookieValue(request, name) {
+  const raw = request.headers.get('cookie') || '';
+  const parts = raw.split(';');
+  for (const part of parts) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() === name) {
+      try { return decodeURIComponent(part.slice(i + 1).trim()); } catch (_) { return ''; }
+    }
+  }
+  return '';
+}
+
+function sessionCookie(token, url) {
+  const secure = url && url.protocol === 'https:' ? '; Secure' : '';
+  return `ww_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL}${secure}`;
+}
+
+function hexToBytes(hex) {
+  const clean = String(hex || '');
+  const out = new Uint8Array(Math.floor(clean.length / 2));
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16) || 0;
+  return out;
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 function emptyStore() {
   return { version: 1, words: [], quizzes: [], attempts: [], activity: [], speakings: [], settings: {}, updatedAt: null };
 }
 
-async function readState(env) {
-  const raw = await env.WORDWISE_KV.get(STATE_KEY);
+async function readState(env, userId) {
+  const raw = await env.WORDWISE_KV.get(stateKey(userId));
   if (!raw) return emptyStore();
   try {
     const s = JSON.parse(raw);
@@ -256,10 +436,10 @@ async function readState(env) {
   }
 }
 
-function json(data, status = 200) {
+function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
+    headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }, extra)
   });
 }
 

@@ -24,5 +24,11 @@
   },
   "observability": {
     "enabled": true
-  }
+  },
+  "routes": [
+    {
+      "pattern": "test.nothing114514.dpdns.org",
+      "custom_domain": true
+    }
+  ]
 }

@@ -8,6 +8,7 @@ import { vizModalBody, mountVizToggles } from '../viz.js';
 import { nlpSentence } from '../nlp.js';
 import { detectHardSentences, articleHash } from '../hardsent.js';
 import { openBacktrans } from '../backtrans.js';
+import { splitSentences } from '../textsplit.js';
 import { parseEbookFile, renderPdfToImages, EBOOK_ACCEPT, FORMAT_LABELS, countWords as countEbookWords } from '../ebook.js';
 import { scanWords, buildKnownSet, computeCoverage, coverageSummary, fetchDictBatch, unknownSurfaceSet, normalizeTerm } from '../coverage.js';
 import { matchArticleVocab, articleVocabEntries, highlightSentence } from '../article-vocab.js';
@@ -59,7 +60,7 @@ function splitArticle(text) {
   const paras = String(text || '').split(/\n\s*\n+/).map((p) => p.trim()).filter(Boolean);
   return paras.map((para) => ({
     para,
-    sentences: para.split(/(?<=[.!?。！？；;])\s+(?=[A-Z"\u201c\u4e00-\u9fa5])|(?<=[。！？；;])\s*/)
+    sentences: splitSentences(para)
       .map((s) => s.trim()).filter(Boolean)
   }));
 }

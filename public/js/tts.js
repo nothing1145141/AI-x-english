@@ -1,3 +1,4 @@
+// 朗读：浏览器自带 speechSynthesis，零依赖、零模型下载、不联网。//
 // 朗读：浏览器自带 speechSynthesis，零依赖、零模型下载、不联网。
 //
 // 用法：
@@ -11,6 +12,7 @@
 // - 浏览器不支持时静默降级：app.js 给 <html> 加 .no-tts，CSS 隐藏所有听按钮。
 
 import { toast } from './ui.js';
+import { splitSentences } from './textsplit.js';
 
 const KEY_VOICE = 'ww.tts.voice';
 const KEY_RATE = 'ww.tts.rate';
@@ -255,8 +257,7 @@ export function splitForSpeech(text) {
   if (!raw) return [];
   const out = [];
   raw.split(/\n\s*\n+/).forEach((para) => {
-    const parts = para
-      .split(/(?<=[.!?])\s+(?=[A-Z"“'(\u4e00-\u9fa5])|(?<=[。！？；;])/)
+    const parts = splitSentences(para)
       .map((s) => clean(s))
       .filter(Boolean);
     // 缩写点号不是句子边界：并到上一句

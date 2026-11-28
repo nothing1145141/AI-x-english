@@ -58,17 +58,19 @@ Key 的三种提供方式，任选一种，都不会进入版本库：
 其余可调项在 `config.json`：端口、监听地址、网关地址（apiBase）、文本/视觉/批改模型、每日题量。
 代码**不内置任何默认网关与模型名**：`apiBase` 与各模型留空时，AI 功能会以可读提示拒绝，需要你自己配置兼容 OpenAI `chat/completions` 的网关。网关与模型同样支持环境变量覆盖：`WORDWISE_API_BASE`、`WORDWISE_TEXT_MODEL`、`WORDWISE_VISION_MODEL`、`WORDWISE_GRADING_MODEL`。
 
-## 数据存放
+## 账号与数据
 
-应用免登录，打开即用：服务端固定使用本机账号（账号表里的第一个账号，没有则自动创建），学习数据按账号存放于 `data/users/<id>.json`，词典等共享资源全机共用。不再提供注册 / 登录入口。
+应用需要登录后使用：打开首页先显示登录屏，可注册新账号或用已有账号登录；会话保存在 httpOnly Cookie 里，服务端记录在 `data/sessions.json`。每个账号一份独立数据，存放于 `data/users/<id>.json`，词典等共享资源全机共用。
+
+早期无密码的本机账号仍可一键进入（登录屏会显示「免登录，继续用本机数据」，仅当账号表里还没有密码账号时出现）；给该账号设置密码后入口自动隐藏。
 
 ## 局域网共享（可选）
 
-默认 `config.json` 的 `host` 为 `0.0.0.0`（局域网内设备可访问）。**免登录模式下数据接口没有鉴权**，同一局域网内的任何设备都能读写你的学习数据；传输还是明文 HTTP。只建议在可信内网临时使用，公共 Wi-Fi 下务必关闭；要仅本机访问，把 `host` 改成 `127.0.0.1`。
+默认 `config.json` 的 `host` 为 `0.0.0.0`（局域网内设备可访问）。同一局域网内可多人分别登录各自账号；传输仍是明文 HTTP，只建议在可信内网临时使用，公共 Wi-Fi 下务必关闭；要仅本机访问，把 `host` 改成 `127.0.0.1`。
 
 ## 部署到 Cloudflare Workers（测试）
 
-仓库内提供 Worker 版本，静态资源由 Workers Assets 提供，`/api/*` 进入 [worker.js](worker.js)，学习数据存 KV。
+仓库内提供 Worker 版本，静态资源由 Workers Assets 提供，`/api/*` 进入 [worker.js](worker.js)，学习数据与账号存 KV。线上地址：`https://test.nothing114514.dpdns.org`（自定义域，避免 workers.dev 在部分网络下无法访问）。
 
 - **测试 Key 已直接写进 `worker.js` 的 `DEFAULTS`**（免费额度，仅用于测试），也可用 `AI_API_KEY` / `AI_API_BASE` 环境变量覆盖。
 - Worker 版能力边界（前端会自动降级，不会报错打断使用）：

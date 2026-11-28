@@ -320,6 +320,14 @@ a:hover { text-decoration: underline; }
 }
 .card + .card { margin-top: 16px; }
 
+/* 登录 / 注册屏 */
+.login-card { max-width: 420px; margin: 8vh auto 0; }
+.login-card h2 { margin-bottom: 4px; }
+
+@media (max-width: 640px) {
+  .login-card { margin: 3vh auto 0; padding: 18px 16px; }
+}
+
 .card-head {
   display: flex; align-items: flex-start; justify-content: space-between;
   gap: 14px; margin-bottom: 16px;

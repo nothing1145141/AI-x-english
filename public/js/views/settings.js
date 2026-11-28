@@ -21,6 +21,7 @@ let mdxLoaded = false;
 let mdxLib = true;
 let mdxBusy = null;   // { phase, pct, detail }
 let lanInfo = null;   // { port, host, lan, hostname, primary, addresses }
+let cloudCfg = null;  // /api/config（含 cloud 标记）
 let voiceWired = false;
 
 export function render() {
@@ -28,6 +29,13 @@ export function render() {
     permLoaded = true;
     getPermissionStatus().then((p) => { perm = p; refresh(); });
     nlpStatus().then((r) => { nlpState = r; refresh(); });
+  }
+  if (cloudCfg === null) {
+    cloudCfg = { loading: true };
+    fetch('/api/config', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((d) => { cloudCfg = d || {}; refresh(); })
+      .catch(() => { cloudCfg = {}; });
   }
   if (!mdxLoaded) {
     mdxLoaded = true;
@@ -43,6 +51,7 @@ export function render() {
   }
   const s = getSettings();
   const state = getState();
+  const isCloud = !!(cloudCfg && cloudCfg.cloud);
   const voices = ttsAvailable() ? englishVoices() : [];
   const ttsVoiceURI = getVoiceURI();
   const ttsRate = getRate();
@@ -51,6 +60,7 @@ export function render() {
       <div>
       <section class="card">
         <div class="card-head"><div><h2>AI 接口配置</h2><div class="sub">支持自定义 API Key 与兼容 OpenAI 的网关</div></div>${icon('sparkles', 18)}</div>
+        ${isCloud ? `<div class="feedback" style="margin-bottom:12px">${icon('info', 13)} 云端部署已内置网关与 Key，默认 Key 模式开箱可用；切到「使用我的 Key」可覆盖为自己的网关。</div>` : ''}
         <div class="field"><label>接口模式</label>
           <div class="row">
             <label class="row small" style="gap:7px"><input type="radio" name="apiMode" value="server" ${s.apiMode === 'server' ? 'checked' : ''} data-setting="apiMode" /> ${isNative() ? '内置默认 Key' : '服务端默认 Key'}</label>
@@ -75,11 +85,11 @@ export function render() {
         <div class="card-head"><div><h2>本地 NLP 句法引擎</h2><div class="sub">先分析句法骨架，再交给 AI 校准讲解</div></div>${icon('layers', 18)}</div>
         <div class="spread">
           <div><strong class="small">状态</strong>
-            <div class="tiny muted">${nlpState === null ? '检测中…' : nlpState.available ? '已就绪 · spaCy 本地运行，无需联网' : '未启用 · 将降级为纯 LLM 模式'}</div></div>
-          <span class="pill ${nlpState?.available ? 'success' : 'warn'}">${nlpState === null ? '…' : nlpState.available ? '运行中' : '未启用'}</span>
+            <div class="tiny muted">${isCloud ? '云端不提供本地句法服务，讲解直接由 AI 完成' : nlpState === null ? '检测中…' : nlpState.available ? '已就绪 · spaCy 本地运行，无需联网' : '未启用 · 将降级为纯 LLM 模式'}</div></div>
+          <span class="pill ${isCloud ? 'success' : nlpState?.available ? 'success' : 'warn'}">${isCloud ? 'AI 模式' : nlpState === null ? '…' : nlpState.available ? '运行中' : '未启用'}</span>
         </div>
-        <div class="feedback mt12">${icon('info', 13)} 引擎在句子讲解/全文分析/划词翻译前先做分词、词形还原、词性与依存句法分析，将确定性结果作为参考注入 AI，减少主干误判与从句漏判。若 Python spaCy 未安装，应用会自动降级，不影响其他功能。</div>
-        <div class="row mt12"><button class="btn btn-sm" data-action="testNlp">${icon('sparkles', 13)} 测试句法分析</button></div>
+        <div class="feedback mt12">${icon('info', 13)} ${isCloud ? '云端版本不运行 Python，句法参考由大模型直接完成，阅读与讲解功能不受影响。' : '引擎在句子讲解/全文分析/划词翻译前先做分词、词形还原、词性与依存句法分析，将确定性结果作为参考注入 AI，减少主干误判与从句漏判。若 Python spaCy 未安装，应用会自动降级，不影响其他功能。'}</div>
+        ${isCloud ? '' : `<div class="row mt12"><button class="btn btn-sm" data-action="testNlp">${icon('sparkles', 13)} 测试句法分析</button></div>`}
       </section>
       </div>
 
@@ -130,13 +140,15 @@ export function render() {
             <button class="btn" data-action="permission">${icon('bell', 14)} 通知权限：${{ granted: '已授予', denied: '已拒绝', default: '未申请', unsupported: '不支持' }[perm] || perm}</button>
             ${isNative()
               ? `<button class="btn" data-action="openNotifySettings">${icon('gear', 14)} 系统通知设置</button>`
-              : `<button class="btn" data-action="togglePush">${icon('shield', 14)} ${s.pushSubscribed ? '关闭后台推送' : '开启后台推送'}</button>`}
+              : isCloud
+                ? ''
+                : `<button class="btn" data-action="togglePush">${icon('shield', 14)} ${s.pushSubscribed ? '关闭后台推送' : '开启后台推送'}</button>`}
             <button class="btn" data-action="testNotify">测试通知</button>
           </div>
-          <div class="feedback mt16">${icon('info', 14)} ${isNative() ? '提醒由系统闹钟触发，即使关闭 App 也会准时通知。首次使用请先授予通知权限。' : '后台推送需要 HTTPS（或 localhost）与 PWA 安装；纯局域网 HTTP 下仍可在应用打开时收到本地提醒。'}</div>
+          <div class="feedback mt16">${icon('info', 14)} ${isCloud ? '云端部署暂不支持后台推送；打开页面时仍会按设定时间弹出应用内提醒。' : isNative() ? '提醒由系统闹钟触发，即使关闭 App 也会准时通知。首次使用请先授予通知权限。' : '后台推送需要 HTTPS（或 localhost）与 PWA 安装；纯局域网 HTTP 下仍可在应用打开时收到本地提醒。'}</div>
         </section>
 
-        <section class="card mt16">
+        <section class="card mt16" style="${isCloud ? 'display:none' : ''}">
           <div class="card-head"><div><h2>局域网访问</h2><div class="sub">手机、平板或另一台电脑连同一个 Wi-Fi，就能打开同一份数据</div></div>${icon('wifi', 18)}</div>
           ${lanInfo && lanInfo.loading
             ? `<div class="tiny muted">正在检测网络…</div>`
@@ -161,7 +173,7 @@ export function render() {
       </div>
     </div>
 
-    <section class="card mt16">
+    <section class="card mt16" style="${isCloud ? 'display:none' : ''}">
       <div class="card-head">
         <div><h2>MDX 词典</h2><div class="sub">导入 MDict 离线词典（.mdx 必需，.mdd 可选用于图片与样式），上传后立即可用，点词即查完整释义</div></div>
         ${icon('book', 18)}

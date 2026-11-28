@@ -1,5 +1,6 @@
 import { init, subscribe, onSync, getState, setSettings, getSettings } from './store.js';
-import { fetchMe, getUser } from './auth.js';
+import { fetchMe, getUser, logout } from './auth.js';
+import { showLogin } from './login-screen.js';
 import { speak as speakText, speakSequence, splitForSpeech, stop as stopSpeaking, ttsAvailable } from './tts.js';
 import { isNative } from './bridge.js';
 import { computeStats } from './stats.js';
@@ -119,9 +120,14 @@ function renderSideUser() {
       <div class="side-avatar">${icon('user', 15)}</div>
       <div class="side-user-text">
         <strong>${escapeHTML(u.nickname || u.username)}</strong>
-        <span>@${escapeHTML(u.username)}</span>
+        <span>@${escapeHTML(u.username)}${u.local ? ' · 本机' : ''}</span>
       </div>
+      <button class="icon-btn" id="logoutBtn" title="退出登录" aria-label="退出登录">${icon('logout', 15)}</button>
     </div>`;
+  box.querySelector('#logoutBtn')?.addEventListener('click', async () => {
+    await logout();
+    location.reload();
+  });
 }
 
 function escapeHTML(v) {
@@ -164,9 +170,18 @@ async function boot() {
     return;
   }
 
-  // 免登录：直接读取服务端固定的本机账号；服务不可达时由外层 catch 显示重试
+  // 会话在使用中失效（过期 / 服务端清理）：切回登录屏，登录后重新进入
+  window.addEventListener('ww:unauthorized', () => {
+    stopSpeaking();
+    showLogin((user) => startApp(user));
+  });
+
+  // 未登录 → 登录屏；服务不可达 → 外层 catch 的错误提示
   const me = await fetchMe();
-  if (!me) throw new Error('服务端未返回本机账号');
+  if (!me) {
+    showLogin((user) => startApp(user));
+    return;
+  }
   await startApp(me);
 }
 
@@ -206,7 +221,7 @@ async function startApp(me) {
   startLocalScheduler();
 
   if (!isNative() && 'serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js').catch((err) => console.warn('SW 注册失败', err));
+    navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).catch((err) => console.warn('SW 注册失败', err));
   }
 }
 

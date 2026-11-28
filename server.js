@@ -440,13 +440,51 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
 
   try {
-    // 免登录模式：恒使用本机账号（账号表第一个；没有则创建），
-    // 学习数据仍按账号独立落盘，但不再向用户暴露登录 / 注册，也不读取旧会话。
-    const currentUser = Object.assign(auth.publicUser(auth.localUser()), { local: true });
+    const token = auth.tokenFrom(req);
+    const sessionHit = token ? auth.findSession(token) : null;
+    const currentUser = sessionHit ? auth.publicUser(sessionHit.user) : null;
 
-    /* ---------- 本机账号 ---------- */
+    /* ---------- 账号与会话 ---------- */
+    if (req.method === 'POST' && p === '/api/auth/register') {
+      const body = await readJsonBody(req, 64 * 1024);
+      try {
+        const user = auth.register(body);
+        const t = auth.createSession(user.id);
+        send(res, 200, { ok: true, user: auth.publicUser(user) }, { 'Set-Cookie': auth.sessionCookie(t, req) });
+      } catch (e) {
+        send(res, 400, { ok: false, error: e.message });
+      }
+      return;
+    }
+    if (req.method === 'POST' && p === '/api/auth/login') {
+      const body = await readJsonBody(req, 64 * 1024);
+      try {
+        const user = auth.login(body);
+        const t = auth.createSession(user.id);
+        send(res, 200, { ok: true, user: auth.publicUser(user) }, { 'Set-Cookie': auth.sessionCookie(t, req) });
+      } catch (e) {
+        send(res, 401, { ok: false, error: e.message });
+      }
+      return;
+    }
+    if (req.method === 'POST' && p === '/api/auth/logout') {
+      auth.destroySession(token);
+      send(res, 200, { ok: true }, { 'Set-Cookie': auth.clearCookie() });
+      return;
+    }
+    // 保留早期本机账号数据：仅当本机账号尚未设置密码时可用
+    if (req.method === 'POST' && p === '/api/auth/local') {
+      if (!auth.localAvailable()) {
+        send(res, 403, { ok: false, error: '本机账号已设置密码，请用用户名和密码登录' });
+        return;
+      }
+      const user = auth.localUser();
+      const t = auth.createSession(user.id);
+      send(res, 200, { ok: true, user: auth.publicUser(user) }, { 'Set-Cookie': auth.sessionCookie(t, req) });
+      return;
+    }
     if (req.method === 'GET' && p === '/api/auth/me') {
-      send(res, 200, { ok: true, user: currentUser });
+      send(res, 200, { ok: true, user: currentUser, localAvailable: auth.localAvailable() });
       return;
     }
 
@@ -580,7 +618,9 @@ const server = http.createServer(async (req, res) => {
     // 本地 NLP 句法分析（自动拉起 Python 服务，失败则降级）
 
     if (req.method === 'GET' && p === '/api/nlp/status') {
-      const ok = await nlp.checkHealth(true);
+      // 服务刚启动时 Python 还在加载模型：先等一下再回答，避免前端误判为「未启用」
+      nlp.ensureStarted();
+      const ok = await nlp.waitReady(2500);
       send(res, 200, { ok, available: ok });
       return;
     }
