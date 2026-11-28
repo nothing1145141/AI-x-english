@@ -1,4 +1,4 @@
-const CACHE = 'wordwise-v27';
+const CACHE = 'wordwise-v28';
 // 预缓存清单必须覆盖 public/js 下所有实际存在的模块（含视图静态 import 的依赖），
 // 否则新装设备离线冷启动时对应功能直接挂掉。新增 JS 模块后务必同步这里并 bump CACHE。
 const ASSETS = [
